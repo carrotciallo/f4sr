@@ -74,7 +74,7 @@
       "id": "bEnableFrameGeneration:Main",
       "type": "switcher",
       "text": "Frame Generation",
-      "help": "Shows generated frames between rendered ones for smoother motion. Adds a little input latency; works best on a variable-refresh (FreeSync / G-Sync) display. Switches live.",
+      "help": "Shows generated frames between rendered ones for smoother motion. Adds a little input latency; works best on a variable-refresh (FreeSync / G-Sync) display. Switches live. Requires upscaling (Native AA counts).",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }

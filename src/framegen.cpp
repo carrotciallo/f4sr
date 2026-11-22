@@ -13,6 +13,7 @@
 #include "settings.h"
 #include "gpu_timing.h"
 #include "xefg_presenter.h"
+#include "swapchain_inner.h"
 
 #include <dx12/ffx_api_dx12.h>
 #include <ffx_framegeneration.h>
@@ -27,6 +28,26 @@ namespace
 	f4sr::FrameGen* g_presentOwner{ nullptr };
 	IDXGISwapChain* g_hookedChain{ nullptr };
 
+	// With a swap chain wrapper (ENB), the generated and real frames are
+	// presented from the inner chain: the wrapper's Present (ENB effects and
+	// per-frame state) runs once per game frame and forwards to the inner chain,
+	// where OnPresent takes the finished frame. Presenting the generated frame
+	// through the wrapper as well ran ENB's per-frame work twice and broke its
+	// lighting (dark shadows, missing ambient).
+	Present_t g_innerOrigPresent{ nullptr };
+	IDXGISwapChain* g_innerChain{ nullptr };
+	thread_local bool tl_inWrapperPresent = false;
+	bool g_innerHit{ false };
+	bool g_innerDisabled{ false };
+
+	HRESULT PresentOn(IDXGISwapChain* chain, UINT syncInterval, UINT flags)
+	{
+		return chain == g_innerChain && g_innerOrigPresent ? g_innerOrigPresent(chain, syncInterval, flags) : g_origPresent(chain, syncInterval, flags);
+	}
+
+	// iFGPresentPath 2 (diagnostic): the old path, both frames through the wrapper.
+	bool InnerRouting() { return g_innerChain != nullptr && !g_innerDisabled && f4sr::GetSettings().fgPresentPath != 2; }
+
 	HRESULT STDMETHODCALLTYPE PresentThunk(IDXGISwapChain* chain, UINT syncInterval, UINT flags)
 	{
 		thread_local bool inside = false;
@@ -39,6 +60,31 @@ namespace
 		if ((flags & DXGI_PRESENT_TEST) == 0 && !f4sr::xefg::Attached())
 			if (auto* data = RE::BSGraphics::RendererData::GetSingleton())
 				f4sr::gpu_timing::MarkAt(reinterpret_cast<ID3D11DeviceContext*>(data->context), f4sr::gpu_timing::kPresent);
+		if ((flags & DXGI_PRESENT_TEST) == 0 && InnerRouting()) {
+			g_innerHit = false;
+			tl_inWrapperPresent = true;
+			const HRESULT hr = g_origPresent(chain, syncInterval, flags);
+			tl_inWrapperPresent = false;
+			static std::uint32_t missedInRow = 0;
+			if (g_innerHit) { missedInRow = 0; return hr; }
+			// The wrapper presented without reaching the inner chain: this
+			// frame is shown, but without generation. Give up on the inner
+			// route after a run of misses.
+			if (++missedInRow >= 60) {
+				g_innerDisabled = true;
+				F4SE::log::warn("f4sr: FG: the wrapper's Present did not reach the inner swap chain 60 times in a row; presenting through the wrapper again");
+			}
+			return hr;
+		}
+		return g_presentOwner->OnPresent(chain, syncInterval, flags);
+	}
+
+	HRESULT STDMETHODCALLTYPE InnerPresentThunk(IDXGISwapChain* chain, UINT syncInterval, UINT flags)
+	{
+		if (!tl_inWrapperPresent || chain != g_innerChain || g_presentOwner == nullptr || (flags & DXGI_PRESENT_TEST) != 0)
+			return g_innerOrigPresent(chain, syncInterval, flags);
+		tl_inWrapperPresent = false;  // one frame per wrapper Present
+		g_innerHit = true;
 		return g_presentOwner->OnPresent(chain, syncInterval, flags);
 	}
 
@@ -104,7 +150,43 @@ namespace f4sr
 		g_presentOwner = this;
 		g_hookedChain = gameChain;
 		F4SE::log::info("f4sr: present hook owner={:p} chain={:p}", static_cast<void*>(this), static_cast<void*>(gameChain));
+		{
+			// Which module's Present the FSR-FG pairs go through (ENB's d3d11.dll
+			// wrapper vs. the system/DXVK dxgi.dll chain).
+			char module[MAX_PATH]{ "?" };
+			HMODULE owner{};
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					reinterpret_cast<LPCSTR>(g_origPresent), &owner))
+				GetModuleFileNameA(owner, module, MAX_PATH);
+			F4SE::log::info("f4sr: hooked Present belongs to {}", module);
+		}
 		return true;
+	}
+
+	void FrameGen::InstallInnerPresentHook(IDXGISwapChain* gameChain)
+	{
+		if (g_innerChain != nullptr) return;
+		DXGI_SWAP_CHAIN_DESC desc{};
+		if (FAILED(gameChain->GetDesc(&desc))) return;
+		int field = -1;
+		std::string module;
+		auto* inner = swapchain::FindInnerChain(gameChain, desc.OutputWindow, field, module);
+		if (inner == nullptr) {
+			F4SE::log::info("f4sr: FG: no swap chain wrapper found; frames are presented on the game chain");
+			return;
+		}
+		void** table = *reinterpret_cast<void***>(inner);
+		DWORD oldProtect{}, ignored{};
+		if (!VirtualProtect(&table[8], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+			F4SE::log::warn("f4sr: FG: inner Present hook protection failed win32={}; presenting through the wrapper", GetLastError());
+			return;
+		}
+		g_innerOrigPresent = reinterpret_cast<Present_t>(table[8]);
+		table[8] = reinterpret_cast<void*>(&InnerPresentThunk);
+		VirtualProtect(&table[8], sizeof(void*), oldProtect, &ignored);
+		g_innerChain = inner;
+		F4SE::log::info("f4sr: FG: frames are presented on the inner swap chain {:p} (wrapper field {}, {}); the wrapper's Present (ENB) runs once per game frame",
+			static_cast<void*>(inner), field, module);
 	}
 
 	bool FrameGen::Create(D3D12Interop& interop, ID3D12Device* device, IDXGISwapChain* gameChain,
@@ -114,6 +196,7 @@ namespace f4sr
 			return false;
 		}
 		if (!Destroy() || !InstallPresentHook(gameChain)) return false;
+		InstallInnerPresentHook(gameChain);
 		// This path currently supports SDR only; never silently reinterpret HDR.
 		if (backBufferFormat != DXGI_FORMAT_R8G8B8A8_UNORM && backBufferFormat != DXGI_FORMAT_B8G8R8A8_UNORM) {
 			F4SE::log::error("f4sr: FG unsupported backbuffer format {}", static_cast<std::uint32_t>(backBufferFormat));
@@ -411,9 +494,16 @@ namespace f4sr
 		}
 		if ((flags & DXGI_PRESENT_TEST) == 0) DumpPresentCaptures(chain);
 		if ((flags & DXGI_PRESENT_TEST) == 0) LogPresentViewport(chain);
-		if ((flags & DXGI_PRESENT_TEST) != 0) return g_origPresent(chain, syncInterval, flags);
+		if ((flags & DXGI_PRESENT_TEST) != 0) return PresentOn(chain, syncInterval, flags);
 		++overlaySample_.source;
 		overlaySample_.enabled = GetSettings().enableFrameGeneration;
+		if (overlaySample_.source % 120 == 1) {
+			// Diagnostic A/B without a restart: edit f4sr.ini while playing.
+			auto& path = GetSettings().fgPresentPath;
+			const int now = PluginIniInt("iFGPresentPath", path);
+			if (now != path) F4SE::log::info("f4sr: FSR-FG present path {} -> {}", path, now);
+			path = now;
+		}
 		auto drawOverlay = [&](bool generated) { DrawOverlay(chain, flags, generated); };
 		// Conservative synchronous FIFO mode: every member of a generated pair
 		// requests at least one vblank. A following interval-zero Present could
@@ -422,7 +512,7 @@ namespace f4sr
 		// A reset/missing-input frame holds the REAL image for the same two-vblank
 		// budget instead of switching to interval zero + tearing. Never present
 		// an invalid interpolation or count a duplicated real image as generated.
-		const bool fifoActive = Created() && chain == chain_ && interop_ != nullptr && interop_->Healthy() &&
+		const bool fifoActive = Created() && (chain == chain_ || (chain == g_innerChain && chain_ == g_hookedChain)) && interop_ != nullptr && interop_->Healthy() &&
 			GetSettings().enableFrameGeneration && MenuBlockReason() == nullptr &&
 			(flags & ~DXGI_PRESENT_ALLOW_TEARING) == 0 && syncInterval <= 1;
 		ApplyFrameLatency(chain, fifoActive);
@@ -430,7 +520,7 @@ namespace f4sr
 		UINT realFlags = fifoActive ? flags & ~DXGI_PRESENT_ALLOW_TEARING : flags;
 		auto presentReal = [&]() {
 			drawOverlay(false);
-			const auto hr = g_origPresent(chain, realInterval, realFlags);
+			const auto hr = PresentOn(chain, realInterval, realFlags);
 			if (fifoActive && realInterval == 2) {
 				++realOnlyPresents_;
 				if (realOnlyPresents_ <= 32 || realOnlyPresents_ % 300 == 0) {
@@ -501,6 +591,12 @@ namespace f4sr
 		}
 		// Reset dispatch primes provider history, but must not display a fake interpolation.
 		if (preparedReset_) { overlaySample_.reason = "RESET: REAL ONLY"; return presentReal(); }
+		if (GetSettings().fgPresentPath == 1) {
+			// Diagnostic: the interpolation ran, but only the real frame is
+			// presented (one Present per game frame, same two-vblank cadence).
+			overlaySample_.reason = "DIAG: GENERATED NOT PRESENTED";
+			return presentReal();
+		}
 		if (GetSettings().frameGenCapture && frameId_ >= 63 && fgCaptureCount_ < 2) CaptureSamples(ctx);
 		overlaySample_.reason = "PAIR SUBMISSION (DISPLAY UNVERIFIED)";
 		realInterval = 1;
@@ -509,7 +605,7 @@ namespace f4sr
 		QueryPerformanceCounter(&generatedStart);
 		ctx->CopyResource(backBuffer.Get(), generated_.tex11.Get());
 		drawOverlay(true);
-		hr = g_origPresent(chain, realInterval, realFlags);
+		hr = PresentOn(chain, realInterval, realFlags);
 		QueryPerformanceCounter(&generatedEnd);
 		if (hr != S_OK) {
 			ctx->CopyResource(backBuffer.Get(), presentColor_.tex11.Get());
@@ -660,7 +756,8 @@ namespace f4sr
 			std::array<std::string, 2> text;
 			for (int i = 0; i < 2; ++i) {
 				text[i] = "#F4SR" + std::string(i ? "   [G] generated frame" : "   [R] real frame") + "\n" + sr + "\n";
-				text[i] += std::string("FG\tFSR-FG 2X  ") + (now.enabled ? "generating" : "!paused") + "\n";
+				text[i] += std::string("FG\tFSR-FG 2X  ") + (now.enabled ? "generating" : "!paused") +
+					(InnerRouting() ? "  (inner chain)" : g_innerChain ? "  (via wrapper)" : "") + "\n";
 				if (!now.enabled) text[i] += std::format("\t!{}\n", now.reason);
 				text[i] += std::format("\t{:.0f} source fps -> {:.0f} submitted/s\n", source, real + gen);
 				if (now.resets || now.failures) text[i] += std::format("\t!resets {}   failures {}\n", now.resets, now.failures);

@@ -1,5 +1,6 @@
 #include "sr_status.h"
 #include "xefg_presenter.h"
+#include "swapchain_inner.h"
 
 #include <Windows.h>
 #include <d3d12.h>
@@ -103,55 +104,9 @@ namespace
 		F4SE::log::info("f4sr: XeFG: {} focus/cursor imports of the swap chain wrapper redirected to the game window (ENB hotkeys and GUI)", patched);
 	}
 
-	bool Readable(const void* p, std::size_t bytes)
-	{
-		if (!p) return false;
-		MEMORY_BASIC_INFORMATION mbi{};
-		if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
-		if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
-		const auto end = static_cast<const std::byte*>(mbi.BaseAddress) + mbi.RegionSize;
-		return static_cast<const std::byte*>(p) + bytes <= end;
-	}
-
-	std::string ModulePath(const void* address)
-	{
-		HMODULE module{};
-		char path[MAX_PATH] = "";
-		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-				static_cast<LPCSTR>(address), &module))
-			GetModuleFileNameA(module, path, MAX_PATH);
-		return path;
-	}
-
-	// Finds the chain ENB's wrapper forwards to: a field of the wrapper that is
-	// a COM object with a vtable in a dxgi module, answers IDXGISwapChain and
-	// presents to our hidden window.
-	IDXGISwapChain* FindInnerChain(IDXGISwapChain* outer, HWND hidden, int& fieldIndex, std::string& module)
-	{
-		auto* const* fields = reinterpret_cast<void* const*>(outer);
-		const auto outerModule = ModulePath(*reinterpret_cast<void* const*>(outer));
-		for (int i = 1; i < 64; ++i) {
-			if (!Readable(&fields[i], sizeof(void*))) break;
-			void* candidate = fields[i];
-			if (candidate == outer || !Readable(candidate, sizeof(void*))) continue;
-			void* const* vtable = *reinterpret_cast<void* const* const*>(candidate);
-			if (!Readable(vtable, 9 * sizeof(void*))) continue;
-			const auto path = ModulePath(vtable);
-			if (path.empty() || path == outerModule) continue;
-			std::string lower = path;
-			std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			if (lower.find("dxgi") == std::string::npos) continue;
-			if (ModulePath(vtable[8]).empty()) continue;
-			ComPtr<IDXGISwapChain> chain;
-			if (FAILED(static_cast<IUnknown*>(candidate)->QueryInterface(IID_PPV_ARGS(&chain))) || !chain) continue;
-			DXGI_SWAP_CHAIN_DESC desc{};
-			if (FAILED(chain->GetDesc(&desc)) || desc.OutputWindow != hidden) continue;
-			fieldIndex = i;
-			module = path;
-			return chain.Get();
-		}
-		return nullptr;
-	}
+	using swapchain::FindInnerChain;
+	using swapchain::ModulePath;
+	using swapchain::Readable;
 
 	// Hang watchdog: OnPresent records which potentially blocking call it is in;
 	// a helper thread logs a step that has not returned within 3 s, and a gap of

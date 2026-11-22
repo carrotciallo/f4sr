@@ -19,6 +19,12 @@ namespace f4sr
 		int xefgInterpolations{ 3 };
 		bool frameGenOverlay{ false };
 		bool frameGenCapture{ false };
+		// FSR-FG diagnostic: how the generated frame is presented.
+		// 0 = normal (from the chain behind a wrapper such as ENB when there is
+		// one), 1 = generated but not presented (one Present per game frame,
+		// same two-vblank cadence), 2 = both frames through the wrapper (the
+		// pre-fix path). Re-read from f4sr.ini while running (PluginIniInt).
+		int fgPresentPath{ 0 };
 		bool enbSubNative{ false };
 		bool debugView{ false };
 		bool forceReset{ false };
@@ -58,5 +64,7 @@ namespace f4sr
 	// last-write time (0 when missing) for change detection.
 	void ReloadMcmSettings();
 	std::uint64_t McmSettingsWriteTime();
+	// One integer from Data\F4SE\Plugins\f4sr.ini [f4sr], read now.
+	int PluginIniInt(const char* key, int fallback);
 	bool ENBPresent();
 }

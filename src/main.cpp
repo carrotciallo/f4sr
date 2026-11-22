@@ -119,10 +119,10 @@ namespace f4sr
 		s.xefgInterpolations = std::clamp(s.xefgInterpolations, 1, 3);
 	}
 
-	void LoadSettings()
+	// The plugin lives in Data\F4SE\Plugins; settings sit next to the exe
+	// under Data\F4SE\Plugins\f4sr.ini.
+	static std::string PluginIniPath()
 	{
-		// The plugin lives in Data\F4SE\Plugins; settings sit next to the exe
-		// under Data\F4SE\Plugins\f4sr.ini.
 		char exePath[MAX_PATH]{};
 		GetModuleFileNameA(nullptr, exePath, MAX_PATH);
 		std::string ini{ exePath };
@@ -131,6 +131,17 @@ namespace f4sr
 			ini.resize(pos + 1);
 		}
 		ini += "Data\\F4SE\\Plugins\\f4sr.ini";
+		return ini;
+	}
+
+	int PluginIniInt(const char* key, int fallback)
+	{
+		return static_cast<int>(GetPrivateProfileIntA("f4sr", key, fallback, PluginIniPath().c_str()));
+	}
+
+	void LoadSettings()
+	{
+		const std::string ini = PluginIniPath();
 
 		auto& s = GetSettings();
 		s.enableUpscaling = GetPrivateProfileIntA("f4sr", "bEnableUpscaling", 1, ini.c_str()) != 0;
@@ -144,6 +155,7 @@ namespace f4sr
 		s.xefgInterpolations = GetPrivateProfileIntA("f4sr", "iXeFGInterpolations", 3, ini.c_str());
 		s.frameGenOverlay = GetPrivateProfileIntA("f4sr", "bFrameGenOverlay", 0, ini.c_str()) != 0;
 		s.frameGenCapture = GetPrivateProfileIntA("f4sr", "bFrameGenCapture", 0, ini.c_str()) != 0;
+		s.fgPresentPath = GetPrivateProfileIntA("f4sr", "iFGPresentPath", 0, ini.c_str());
 		s.enbSubNative = GetPrivateProfileIntA("f4sr", "bENBSubNative", 0, ini.c_str()) != 0;
 		s.debugView = GetPrivateProfileIntA("f4sr", "bDebugView", 0, ini.c_str()) != 0;
 		s.forceReset = GetPrivateProfileIntA("f4sr", "bForceReset", 0, ini.c_str()) != 0;
@@ -174,6 +186,7 @@ namespace f4sr
 		// [Main] (the page's control ids are "<key>:Main"). When that
 		// file has a key, it wins over the plugin ini defaults above.
 		ApplyMcmSettings(s, true);
+		F4SE::log::info("f4sr: FSR-FG present path {}", s.fgPresentPath);
 		F4SE::log::info("f4sr: diagnostics overlay={} fgCapture={} captures={} captureKey=0x{:02X} textureProbe={} postDepth={} dynResGuard={}",
 			s.frameGenOverlay, s.frameGenCapture, s.diagnostics, s.captureKey, s.textureProbe, s.postDepth, s.dynResGuard);
 

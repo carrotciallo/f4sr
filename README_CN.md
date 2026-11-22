@@ -94,7 +94,7 @@ MCM 页面覆盖了大多数玩家需要的选项：
 - **命令：**
   ```sh
   tools/build-f4sr.sh --staticdeps
-  tools/package.sh build-sf dist/f4sr-v1.0.0-rc.2.zip
+  tools/package.sh build-sf dist/f4sr-v1.0.0-rc.3.zip
   ```
 
 ## 致谢

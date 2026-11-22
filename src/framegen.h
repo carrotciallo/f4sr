@@ -43,6 +43,8 @@ namespace f4sr
 		bool Create(D3D12Interop& interop, ID3D12Device* device, IDXGISwapChain* gameChain,
 			std::uint32_t displayWidth, std::uint32_t displayHeight, DXGI_FORMAT backBufferFormat);
 		bool InstallPresentHook(IDXGISwapChain* gameChain);
+		// Presents from the chain behind a wrapper (ENB) when there is one.
+		void InstallInnerPresentHook(IDXGISwapChain* gameChain);
 		bool Destroy();
 		void Invalidate(bool reset = false) { resetNext_ = resetNext_ || prepared_ || reset; prepared_ = false; hudlessReady_ = false; }
 		void CaptureHudless(void* rtManager);
