@@ -4,6 +4,8 @@
 
 Super resolution and frame generation for Fallout 4, as an F4SE plugin.
 
+**Download:** [Nexus Mods](https://www.nexusmods.com/fallout4/mods/111754) · [GitHub Releases](https://github.com/carrotciallo/f4sr/releases)
+
 F4SR replaces the game's TAA with a modern temporal upscaler and can add generated frames on top:
 
 - **Upscaling:** AMD FSR 3.1, AMD FSR 4.1, or Intel XeSS. Each has four render-resolution presets, from Native (AA only) down to Performance (50%).

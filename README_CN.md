@@ -4,6 +4,8 @@
 
 为《辐射 4》提供超分辨率与帧生成的 F4SE 插件。
 
+**下载：** [Nexus Mods](https://www.nexusmods.com/fallout4/mods/111754) · [GitHub Releases](https://github.com/carrotciallo/f4sr/releases)
+
 F4SR 用现代时域超分替换游戏自带的 TAA，并可在此之上叠加生成帧：
 
 - **超分：** AMD FSR 3.1、AMD FSR 4.1 或 Intel XeSS。每种都有四档渲染分辨率预设，从原生（仅抗锯齿）到性能（50%）。
