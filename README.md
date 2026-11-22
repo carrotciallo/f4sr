@@ -4,8 +4,6 @@
 
 Super resolution and frame generation for Fallout 4, as an F4SE plugin.
 
-**Download:** [Nexus Mods](https://www.nexusmods.com/fallout4/mods/111754) · [GitHub Releases](https://github.com/carrotciallo/f4sr/releases)
-
 F4SR replaces the game's TAA with a modern temporal upscaler and can add generated frames on top:
 
 - **Upscaling:** AMD FSR 3.1, AMD FSR 4.1, or Intel XeSS. Each has four render-resolution presets, from Native (AA only) down to Performance (50%).
@@ -27,13 +25,15 @@ F4SR replaces the game's TAA with a modern temporal upscaler and can add generat
 | MCM (optional) | [Mod Configuration Menu](https://www.nexusmods.com/fallout4/mods/21497), for in-game settings |
 | GPU | Any GPU with D3D12 support. FSR 4.1 is heaviest; on RDNA3 it runs as INT8. FSR 3.1 is lightest. |
 | OS | Windows 10/11, or Linux with Proton |
+| Runtime | [Microsoft Visual C++ v14 Redistributable (x64)](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist), current version; in the game's prefix on Proton if missing |
 
 ## Installation
 
-1. Install with a mod manager, or copy the `Data` folder into the game folder.
-2. Copy `fmt.dll` and `spdlog.dll` next to `Fallout4.exe`.
-3. Start the game through F4SE.
-4. Open **MCM → F4SR**, or edit `Data/F4SE/Plugins/f4sr.ini`.
+1. In MO2, install the ZIP as-is. Its data root already contains `F4SE/` and `MCM/`; Root Builder is not needed. For manual installation, merge those folders into the game's `Data/`.
+2. Start the game through F4SE.
+3. Open **MCM → F4SR**, or edit `Data/F4SE/Plugins/f4sr.ini`.
+
+When upgrading from RC1, replace the old F4SR mod and keep `Data/MCM/Settings/f4sr.ini`. This release no longer ships loose `fmt.dll` or `spdlog.dll`. Remove RC1 copies next to `Fallout4.exe` only if you know no other plugin uses them.
 
 Disable other upscaler or frame-generation mods for Fallout 4 first. Two plugins hooking the same render path will conflict.
 
@@ -89,13 +89,12 @@ Reports from Windows, NVIDIA and Intel GPUs, and other resolutions are especiall
 
 ## Building
 
-- **Toolchain:** clang-cl and lld-link with the MSVC CRT and Windows SDK, plus vcpkg (`x64-windows-clang` triplet).
-- **Dependencies:** CommonLibF4, the FidelityFX SDK and the XeSS SDK under `sdk/`.
+- **Toolchain:** clang-cl and lld-link with the MSVC CRT and Windows SDK, plus vcpkg (`x64-windows-clang-staticdeps` for release packages: static fmt/spdlog, dynamic CRT). Packaging needs `llvm-readobj`, `zip`, and `unzip`.
+- **Dependencies:** CommonLibF4 under `third_party/`, with the FidelityFX and XeSS SDKs under `sdk/`.
 - **Commands:**
   ```sh
-  . tools/env.sh
-  cmake --build build --target f4sr
-  tools/package.sh   # assembles package/
+  tools/build-f4sr.sh --staticdeps
+  tools/package.sh build-sf dist/f4sr-v1.0.0-rc.2.zip
   ```
 
 ## Credits

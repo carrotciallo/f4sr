@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+    <moduleName>F4SR</moduleName>
+    <requiredInstallFiles>
+        <folder source="F4SE" destination="F4SE" />
+        <folder source="MCM" destination="MCM" />
+        <folder source="licenses" destination="licenses" />
+        <file source="README.md" destination="README.md" />
+        <file source="README_CN.md" destination="README_CN.md" />
+        <file source="LICENSE" destination="LICENSE" />
+    </requiredInstallFiles>
+</config>

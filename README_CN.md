@@ -4,8 +4,6 @@
 
 为《辐射 4》提供超分辨率与帧生成的 F4SE 插件。
 
-**下载：** [Nexus Mods](https://www.nexusmods.com/fallout4/mods/111754) · [GitHub Releases](https://github.com/carrotciallo/f4sr/releases)
-
 F4SR 用现代时域超分替换游戏自带的 TAA，并可在此之上叠加生成帧：
 
 - **超分：** AMD FSR 3.1、AMD FSR 4.1 或 Intel XeSS。每种都有四档渲染分辨率预设，从原生（仅抗锯齿）到性能（50%）。
@@ -27,13 +25,15 @@ F4SR 用现代时域超分替换游戏自带的 TAA，并可在此之上叠加�
 | MCM（可选） | [Mod Configuration Menu](https://www.nexusmods.com/fallout4/mods/21497)，用于游戏内设置 |
 | GPU | 任何支持 D3D12 的 GPU。FSR 4.1 负载最高，在 RDNA3 上以 INT8 方式运行；FSR 3.1 最轻。 |
 | 系统 | Windows 10/11，或 Linux + Proton |
+| 运行库 | 最新的 [Microsoft Visual C++ v14 Redistributable（x64）](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)；若 Proton 环境缺少运行库，装入游戏自己的 prefix |
 
 ## 安装
 
-1. 用模组管理器安装，或把 `Data` 文件夹复制进游戏目录。
-2. 把 `fmt.dll` 和 `spdlog.dll` 复制到 `Fallout4.exe` 旁边。
-3. 通过 F4SE 启动游戏。
-4. 打开 **MCM → F4SR**，或编辑 `Data/F4SE/Plugins/f4sr.ini`。
+1. 在 MO2 中直接安装 ZIP。包根已包含 `F4SE/` 和 `MCM/`，无需 Root Builder。手动安装时，把这两个文件夹合并到游戏的 `Data/`。
+2. 通过 F4SE 启动游戏。
+3. 打开 **MCM → F4SR**，或编辑 `Data/F4SE/Plugins/f4sr.ini`。
+
+从 RC1 升级时，替换旧 F4SR 模组，保留 `Data/MCM/Settings/f4sr.ini`。新版不再附带散装 `fmt.dll` 或 `spdlog.dll`。仅当确认 `Fallout4.exe` 旁的文件来自 RC1、且没有其他插件使用时，再清理它们。
 
 先禁用其他《辐射 4》超分或帧生成模组。两个插件挂同一条渲染路径会冲突。
 
@@ -89,13 +89,12 @@ MCM 页面覆盖了大多数玩家需要的选项：
 
 ## 构建
 
-- **工具链：** clang-cl 与 lld-link，配合 MSVC CRT 与 Windows SDK，外加 vcpkg（`x64-windows-clang` triplet）。
-- **依赖：** CommonLibF4，以及 `sdk/` 下的 FidelityFX SDK 与 XeSS SDK。
+- **工具链：** clang-cl 与 lld-link，配合 MSVC CRT、Windows SDK 和 vcpkg（发行包使用 `x64-windows-clang-staticdeps`：静态链接 fmt/spdlog，保留动态 CRT）。打包需要 `llvm-readobj`、`zip` 和 `unzip`。
+- **依赖：** `third_party/` 下的 CommonLibF4，以及 `sdk/` 下的 FidelityFX SDK、XeSS SDK。
 - **命令：**
   ```sh
-  . tools/env.sh
-  cmake --build build --target f4sr
-  tools/package.sh   # assembles package/
+  tools/build-f4sr.sh --staticdeps
+  tools/package.sh build-sf dist/f4sr-v1.0.0-rc.2.zip
   ```
 
 ## 致谢
