@@ -1,0 +1,23 @@
+# External SDKs and sources (fetched, not authored here)
+sdk/
+third_party/
+
+# Build trees and logs
+build/
+build-clf4/
+build-*.log
+.cache/
+__pycache__/
+*.zip
+
+# Package binaries are assembled by tools/package.sh from the build
+package/*.dll
+package/**/*.dll
+
+# tools/: track only the project's own scripts, sources and triplets;
+# toolchains (msvc, vcpkg, xwin), downloaded DLLs and probe outputs stay local
+tools/*
+!tools/*.sh
+!tools/*.py
+!tools/*.cpp
+!tools/triplets/

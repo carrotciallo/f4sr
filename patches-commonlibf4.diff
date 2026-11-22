@@ -1,0 +1,45 @@
+diff --git a/CommonLibF4/include/RE/Bethesda/BSAudioManager.h b/CommonLibF4/include/RE/Bethesda/BSAudioManager.h
+index e0800ba..b218f85 100644
+--- a/CommonLibF4/include/RE/Bethesda/BSAudioManager.h
++++ b/CommonLibF4/include/RE/Bethesda/BSAudioManager.h
+@@ -4,6 +4,7 @@
+ #include "RE/Bethesda/BSTArray.h"
+ #include "RE/Bethesda/BSTHashMap.h"
+ #include "RE/Bethesda/BSTList.h"
++#include "RE/Bethesda/FormComponents.h"
+ #include "RE/NetImmerse/NiAVObject.h"
+ #include "RE/NetImmerse/NiPoint.h"
+ #include "RE/NetImmerse/NiSmartPointer.h"
+@@ -18,7 +19,6 @@ namespace RE
+ 	class BSAudioManagerThread;
+ 	class BSGameSound;
+ 	class BSISoundDescriptor;
+-	struct BSISoundDescriptor::ExtraResolutionData;
+ 	class BSISoundOutputModel;
+ 	class BSMultisound;
+ 	class BSSoundInfo;
+diff --git a/CommonLibF4/include/RE/Bethesda/SendPapyrusEvent.h b/CommonLibF4/include/RE/Bethesda/SendPapyrusEvent.h
+index 2c0442e..e02a33a 100644
+--- a/CommonLibF4/include/RE/Bethesda/SendPapyrusEvent.h
++++ b/CommonLibF4/include/RE/Bethesda/SendPapyrusEvent.h
+@@ -1,6 +1,6 @@
+ #pragma once
+ #include <F4SE/API.h>
+-#include <F4SE/interfaces.h>
++#include <F4SE/Interfaces.h>
+ #include <RE/Bethesda/BSScriptUtil.h>
+ #include <RE/Bethesda/FunctionArgs.h>
+ #include <RE/msvc/functional.h>
+diff --git a/CommonLibF4/src/F4SE/API.cpp b/CommonLibF4/src/F4SE/API.cpp
+index 8fa9f6a..46367cd 100644
+--- a/CommonLibF4/src/F4SE/API.cpp
++++ b/CommonLibF4/src/F4SE/API.cpp
+@@ -30,7 +30,7 @@ namespace F4SE
+ 			REL::Version                                     f4seVersion{};
+ 			PluginHandle                                     pluginHandle{ static_cast<PluginHandle>(-1) };
+ 			std::uint32_t                                    releaseIndex{ 0 };
+-			std::function<const void*(F4SEAPI)(const char*)> pluginInfoAccessor;
++			std::function<const void*(const char*)> pluginInfoAccessor;
+ 			std::string_view                                 saveFolderName{};
+ 
+ 			MessagingInterface*     messagingInterface{ nullptr };

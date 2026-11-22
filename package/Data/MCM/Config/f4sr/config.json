@@ -1,0 +1,163 @@
+{
+  "modName": "f4sr",
+  "displayName": "F4SR",
+  "minMcmVersion": 2,
+  "content": [
+    {
+      "type": "section",
+      "text": "Upscaling"
+    },
+    {
+      "id": "bEnableUpscaling:Main",
+      "type": "switcher",
+      "text": "Upscaling",
+      "help": "Turns F4SR upscaling on or off. Applies when you close the menu.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "id": "iBackend:Main",
+      "type": "dropdown",
+      "text": "Upscaler",
+      "help": "FSR 4.1: best image quality, highest GPU cost (runs as INT8 on RDNA3). FSR 3.1: lowest cost. XeSS: Intel's upscaler, runs on any GPU. Applies when you close the menu.",
+      "valueOptions": {
+        "sourceType": "ModSettingInt",
+        "options": [
+          "FSR 3.1",
+          "FSR 4.1",
+          "XeSS"
+        ]
+      }
+    },
+    {
+      "id": "iQualityMode:Main",
+      "type": "dropdown",
+      "text": "Render Resolution",
+      "help": "Resolution the game renders at before upscaling, per axis. Native keeps full resolution and only replaces the game's anti-aliasing. Lower settings are faster and softer. Applies when you close the menu.",
+      "valueOptions": {
+        "sourceType": "ModSettingInt",
+        "options": [
+          "Native (AA only)",
+          "Quality (67%)",
+          "Balanced (59%)",
+          "Performance (50%)"
+        ]
+      }
+    },
+    {
+      "id": "fSharpness:Main",
+      "type": "slider",
+      "text": "Sharpening",
+      "help": "FSR's sharpening (RCAS). 0 turns it off. XeSS ignores it. If ENB also sharpens, keep this low or at 0.",
+      "valueOptions": {
+        "min": 0,
+        "max": 1,
+        "step": 0.05,
+        "sourceType": "ModSettingFloat"
+      }
+    },
+    {
+      "id": "bReactiveMask:Main",
+      "type": "switcher",
+      "text": "Transparency Mask",
+      "help": "Marks pixels changed by transparent effects (particles, fire, glass, water) so the upscaler does not smear or ghost them. Recommended on. Turning it on takes effect after a game restart.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "type": "section",
+      "text": "Frame Generation"
+    },
+    {
+      "id": "bEnableFrameGeneration:Main",
+      "type": "switcher",
+      "text": "Frame Generation",
+      "help": "Shows generated frames between rendered ones for smoother motion. Adds a little input latency; works best on a variable-refresh (FreeSync / G-Sync) display. Switches live.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "id": "iFrameGenEngine:Main",
+      "type": "dropdown",
+      "text": "Frame Generation Engine",
+      "help": "FSR-FG: AMD frame generation, 2X. XeSS-FG: Intel frame generation, 2X to 4X (multiplier below). Restart the game after changing this.",
+      "valueOptions": {
+        "sourceType": "ModSettingInt",
+        "options": [
+          "FSR-FG (2X)",
+          "XeSS-FG (2X - 4X)"
+        ]
+      }
+    },
+    {
+      "id": "iXeFGMode:Main",
+      "type": "dropdown",
+      "text": "XeSS-FG Multiplier",
+      "help": "Frames shown per rendered frame: 3X shows two generated frames for each real one. Pick the value where real FPS x multiplier is close to your refresh rate; going higher adds latency without adding visible frames. Applies live.",
+      "valueOptions": {
+        "sourceType": "ModSettingInt",
+        "options": [
+          "2X",
+          "3X",
+          "4X"
+        ]
+      }
+    },
+    {
+      "type": "section",
+      "text": "ENB"
+    },
+    {
+      "id": "bENBSubNative:Main",
+      "type": "switcher",
+      "text": "Allow Lower Render Resolutions with ENB",
+      "help": "Allows Quality / Balanced / Performance while ENB is installed. The image is upscaled before ENB's post-processing, so ENB still works at full resolution. Native works either way.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "type": "section",
+      "text": "Diagnostics"
+    },
+    {
+      "id": "bFrameGenOverlay:Main",
+      "type": "switcher",
+      "text": "Status Panel",
+      "help": "Small panel in the top-left corner: upscaler, render and output resolution, upscaler GPU time, frame generation rate. Switches live.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "id": "bDebugView:Main",
+      "type": "switcher",
+      "text": "FSR Debug View",
+      "help": "Replaces the image with FidelityFX's debug view (motion vectors, reactive mask). For troubleshooting only.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "id": "bForceReset:Main",
+      "type": "switcher",
+      "text": "Force History Reset",
+      "help": "Troubleshooting: clears the upscaler's history every frame. If ghosting disappears with this on, the problem is in the motion vectors.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "id": "bFrameGenCapture:Main",
+      "type": "switcher",
+      "text": "Capture FG Sample Frames",
+      "help": "Developer diagnostic: saves a few frame-generation sample images to the game folder. May stutter briefly. Leave off.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    }
+  ]
+}
