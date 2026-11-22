@@ -41,6 +41,9 @@ namespace f4sr
 		// kPostPostLoad: reinstall in front of hooks other plugins added later.
 		void ReclaimSwapChainRedirect();
 		[[nodiscard]] bool Attached();
+		// The swap chain redirect was installed at startup (XeSS-FG selected and
+		// frame generation on).
+		[[nodiscard]] bool RedirectInstalled();
 		// Render start of a frame (XeLL SIMULATION_END / RENDERSUBMIT_START).
 		void OnFrameStart();
 		// Before the UI draws: copies the HUD-less frame.

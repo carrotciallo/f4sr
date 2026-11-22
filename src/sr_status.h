@@ -20,7 +20,8 @@ namespace f4sr::sr_status
 		std::atomic<std::uint32_t> renderW{}, renderH{}, outputW{}, outputH{};
 		std::atomic<int> quality{ -1 };
 		std::atomic<double> gpuMs{ -1.0 };
-		std::atomic<bool> reactive{};       // a reactive mask went with the last dispatch  // last 5 s average of the SR segment (gpu_timing)
+		std::atomic<bool> reactive{};
+		std::atomic<const char*> note{};    // panel hint (static string) or null       // a reactive mask went with the last dispatch  // last 5 s average of the SR segment (gpu_timing)
 	};
 	inline State g;
 
@@ -61,6 +62,7 @@ namespace f4sr::sr_status
 		std::string out = std::format("SR\t{}  {}\n\t{}x{} -> {}x{}\n",
 			backend, q >= 0 && q < 4 ? kQuality[q] : "-",
 			g.renderW.load(), g.renderH.load(), g.outputW.load(), g.outputH.load());
+		if (const char* note = g.note.load(std::memory_order_relaxed)) out += note;
 		if (n == 0 || (seconds > 0 && rate < 1.0))
 			out += "\t!not dispatching\n";
 		else

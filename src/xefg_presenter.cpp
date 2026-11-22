@@ -53,6 +53,7 @@ namespace
 	CreateDeviceAndSwapChain_t g_firstCreate{ nullptr };
 	Present_t g_origPresent{ nullptr };
 	bool g_redirectUsed{ false };
+	bool g_redirectInstalled{ false };
 
 	// ENB wraps the swap chain (myIDXGISwapChain) and applies its effects in
 	// the wrapper's Present before calling the inner DXVK chain's Present.
@@ -104,7 +105,6 @@ namespace
 		F4SE::log::info("f4sr: XeFG: {} focus/cursor imports of the swap chain wrapper redirected to the game window (ENB hotkeys and GUI)", patched);
 	}
 
-	using swapchain::FindInnerChain;
 	using swapchain::ModulePath;
 	using swapchain::Readable;
 
@@ -471,28 +471,44 @@ namespace
 			DWORD ignored{};
 			VirtualProtect(&vtable[8], sizeof(void*), oldProtect, &ignored);
 			gameChain = chain;
-			int field = -1;
-			std::string innerModule;
-			if (auto* inner = FindInnerChain(chain, hidden, field, innerModule)) {
+			// Frames are taken directly below ENB and that Present is not
+			// forwarded (a second window never gets its buffers back under
+			// gamescope), so layers below ENB never run under XeSS-FG.
+			const auto layers = swapchain::Stack(chain, hidden);
+			F4SE::log::info("f4sr: XeFG: swap chain layers: {}", swapchain::Describe(layers));
+			const int below = swapchain::BelowEnb(layers);
+			if (below > 0) {
+				auto* inner = layers[below].chain;
 				void** innerTable = *reinterpret_cast<void***>(inner);
 				if (VirtualProtect(&innerTable[8], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
 					g_innerOrigPresent = reinterpret_cast<Present_t>(innerTable[8]);
 					innerTable[8] = reinterpret_cast<void*>(&InnerPresentThunk);
 					VirtualProtect(&innerTable[8], sizeof(void*), oldProtect, &ignored);
 					g_innerChain = inner;
-					F4SE::log::info("f4sr: XeFG: frames are taken from the inner swap chain {:p} (wrapper field {}, {}), after the wrapper's Present (ENB)",
-						static_cast<void*>(inner), field, innerModule);
+					F4SE::log::info("f4sr: XeFG: frames are taken from {} {:p}, after ENB's Present", layers[below].Describe(), static_cast<void*>(inner));
+					if (HMODULE enb = swapchain::ModuleOf(*reinterpret_cast<void* const*>(layers[below - 1].chain)))
+						RedirectWrapperFocus(enb, real, hidden);
 				}
 			}
-			if (g_innerChain) {
-				HMODULE wrapper{};
-				if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-						static_cast<LPCSTR>(*reinterpret_cast<void* const*>(chain)), &wrapper))
-					RedirectWrapperFocus(wrapper, real, hidden);
-			}
-			if (!g_innerChain)
-				F4SE::log::warn("f4sr: XeFG: no inner swap chain found behind {} ; frames are taken before the wrapper's Present (ENB effects applied there are missing)",
-					ModulePath(*reinterpret_cast<void* const*>(chain)));
+			// A wrapper that also hooks the DXGI factory the XeFG output chain
+			// was created from (ReShade as dxgi.dll) runs there, on every frame
+			// the proxy presents, generated ones included. The factory's module
+			// says so without walking XeFG's own objects.
+			const auto factoryModule = swapchain::ModulePath(*reinterpret_cast<void* const*>(factory.Get()));
+			F4SE::log::info("f4sr: XeFG: output chain created through {}", factoryModule);
+			auto reportBypassed = [&](const swapchain::Layer& layer) {
+				const bool onOutput = !factoryModule.empty() && _stricmp(factoryModule.c_str(), layer.module.c_str()) == 0;
+				if (onOutput)
+					F4SE::log::info("f4sr: XeFG: {} is skipped on the game chain but also wraps the XeFG output chain; its effects apply to every presented frame",
+						layer.Describe());
+				else
+					F4SE::log::warn("f4sr: XeFG: {} is bypassed: its effects and overlay are not shown under XeSS-FG (use FSR-FG for it)",
+						layer.Describe());
+			};
+			for (std::size_t i = (below > 0 ? below : 1); i + 1 < layers.size(); ++i) reportBypassed(layers[i]);
+			if (below < 0 && layers.size() > 1 && !layers[0].Enb()) reportBypassed(layers[0]);
+			if (!g_innerChain && std::any_of(layers.begin(), layers.end(), [](const swapchain::Layer& l) { return l.Enb(); }))
+				F4SE::log::warn("f4sr: XeFG: ENB found but no chain below it; frames are taken before ENB's Present (effects applied there are missing)");
 			attached = true;
 			StartWatchdog();
 			F4SE::log::info("f4sr: XeFG attached: proxy chain {}x{} fmt={} buffers={} FLIP_DISCARD on game window {:p} (game chain on hidden window {:p}); "
@@ -887,6 +903,14 @@ namespace f4sr::xefg
 	void InstallSwapChainRedirect()
 	{
 		if (GetSettings().frameGenEngine != 1) return;
+		// The swap chain is redirected only when XeSS-FG can actually run, so
+		// players who never use frame generation keep the game's own chain.
+		// The chain is created once at startup: turning frame generation on
+		// later needs a restart before XeSS-FG attaches.
+		if (!GetSettings().enableFrameGeneration) {
+			F4SE::log::info("f4sr: XeFG: frame generation is off at startup; the swap chain is left as is (turning it on needs a game restart)");
+			return;
+		}
 		const auto original = REL::PatchIAT(&CreateDeviceAndSwapChainHook, "d3d11.dll", "D3D11CreateDeviceAndSwapChain");
 		g_origCreate = reinterpret_cast<CreateDeviceAndSwapChain_t>(original);
 		g_firstCreate = g_origCreate;
@@ -894,8 +918,11 @@ namespace f4sr::xefg
 			F4SE::log::error("f4sr: XeFG: d3d11.dll!D3D11CreateDeviceAndSwapChain import not found; XeSS-FG unavailable");
 			return;
 		}
+		g_redirectInstalled = true;
 		F4SE::log::info("f4sr: XeFG: swap chain creation redirected (import of D3D11CreateDeviceAndSwapChain)");
 	}
+
+	bool RedirectInstalled() { return g_redirectInstalled; }
 
 	// Plugins loaded after f4sr (e.g. NVIDIA_Reflex) may re-patch the same
 	// import and call d3d11.dll directly, skipping our hook. Once every plugin

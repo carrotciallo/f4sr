@@ -8,8 +8,10 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <d3d11_1.h>
 #include <fstream>
+#include <span>
 #include <string>
 
 namespace f4sr::late_trace
@@ -353,6 +355,90 @@ namespace f4sr::late_trace
 	}
 	void EndMotion() { if(active && w.motion) End(); }
 
+	namespace
+	{
+		std::atomic<SubNative> subNative{ SubNative::Pending };
+		std::atomic<const char*> subNativeReason{ "" };
+
+		void SubNativeUnavailable(const char* why)
+		{
+			if (subNative.exchange(SubNative::Unavailable) != SubNative::Unavailable) {
+				subNativeReason = why;
+				F4SE::log::warn("f4sr: lower render resolutions with ENB unavailable: {}; staying at native resolution", why);
+			}
+		}
+
+		// ENB's (game-directory d3d11.dll) two early-scene call sites into the
+		// D3D11 context: DrawIndexed (vslot 12) of the producer and Draw
+		// (vslot 13) of the consumer. Found by instruction signature rather
+		// than a fixed build: the producer call is unique in ENB's code, the
+		// consumer is the first matching call within 4 KiB after it.
+		struct EnbSites { const void* producerReturn{}; const void* consumerReturn{}; };
+
+		EnbSites LocateEnbSites()
+		{
+			static const EnbSites sites = [] {
+				EnbSites out{};
+				wchar_t exe[MAX_PATH]{}; const auto n=GetModuleFileNameW(nullptr,exe,MAX_PATH);
+				auto mod=n && n<MAX_PATH ? GetModuleHandleW((std::filesystem::path(exe).parent_path()/L"d3d11.dll").c_str()):nullptr;
+				if(!mod) { F4SE::log::info("f4sr: ENB d3d11.dll not loaded; no early-scene call sites"); return out; }
+				const auto base=reinterpret_cast<const std::uint8_t*>(mod);
+				const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+				const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS64*>(base+dos->e_lfanew);
+				// mov rax,[rcx]; mov edx,ebp; call [rax+60h]
+				constexpr std::uint8_t producer[]{0x48,0x8b,0x01,0x8b,0xd5,0xff,0x50,0x60};
+				// mov rax,[rcx]; lea edx,[r8+6]; call [rax+68h]
+				constexpr std::uint8_t consumer[]{0x48,0x8b,0x01,0x41,0x8d,0x50,0x06,0xff,0x50,0x68};
+				const std::uint8_t* found{}; int producers=0;
+				const auto* section=IMAGE_FIRST_SECTION(nt);
+				std::span<const std::uint8_t> code[16]{}; int sections=0;
+				for(WORD k=0;k<nt->FileHeader.NumberOfSections && sections<16;++k,++section)
+					if(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)
+						code[sections++]={base+section->VirtualAddress,section->Misc.VirtualSize};
+				for(int k=0;k<sections;++k) {
+					const auto& c=code[k];
+					for(auto it=std::search(c.begin(),c.end(),std::begin(producer),std::end(producer)); it!=c.end();
+						it=std::search(it+1,c.end(),std::begin(producer),std::end(producer))) {
+						++producers; found=&*it;
+					}
+				}
+				const std::uint8_t* consumerAt{};
+				if(producers==1) {
+					for(int k=0;k<sections && !consumerAt;++k) {
+						const auto& c=code[k];
+						if(found<c.data() || found>=c.data()+c.size()) continue;
+						const auto from=c.begin()+(found-c.data());
+						const auto to=from+std::min<std::ptrdiff_t>(0x1000,c.end()-from);
+						const auto it=std::search(from,to,std::begin(consumer),std::end(consumer));
+						if(it!=to) consumerAt=&*it;
+					}
+				}
+				const auto rva=[&](const std::uint8_t* p){ return static_cast<std::uint32_t>(p-base); };
+				if(producers!=1 || !consumerAt) {
+					F4SE::log::warn("f4sr: ENB early-scene call sites not found (producer matches={}, consumer {}; image size 0x{:X})",
+						producers, consumerAt ? "found" : "missing", nt->OptionalHeader.SizeOfImage);
+					return out;
+				}
+				out.producerReturn=found+sizeof(producer); out.consumerReturn=consumerAt+sizeof(consumer);
+				F4SE::log::info("f4sr: ENB early-scene call sites at +0x{:X} / +0x{:X} (image size 0x{:X}{})",
+					rva(static_cast<const std::uint8_t*>(out.producerReturn)), rva(static_cast<const std::uint8_t*>(out.consumerReturn)),
+					nt->OptionalHeader.SizeOfImage,
+					nt->OptionalHeader.SizeOfImage==0x3b7000 && rva(static_cast<const std::uint8_t*>(out.producerReturn))==0x78399 ? ", the build F4SR was developed on" : ", signature match");
+				return out;
+			}();
+			return sites;
+		}
+	}
+
+	SubNative SubNativeState()
+	{
+		if (subNative.load() != SubNative::Unavailable && !LocateEnbSites().producerReturn)
+			SubNativeUnavailable("ENB's early-scene draw calls were not found in this ENB version");
+		return subNative.load();
+	}
+
+	const char* SubNativeReason() { return subNativeReason.load(); }
+
 	void RunEarlyPass(Ctx* outer,ID3D11Texture2D* mainCopy,EarlyPassFn original,void* pass,std::uint32_t technique,bool flag)
 	{
 		namespace bt=backend_trace;
@@ -360,26 +446,23 @@ namespace f4sr::late_trace
 		ComPtr<ID3D11DeviceContext1> inner; outer->QueryInterface(IID_PPV_ARGS(&inner));
 		auto** v=inner?*reinterpret_cast<void***>(inner.Get()):nullptr;
 		if(!bt::fixedTable) {
-			wchar_t exe[MAX_PATH]{}; auto n=GetModuleFileNameW(nullptr,exe,MAX_PATH);
-			auto mod=n && n<MAX_PATH ? GetModuleHandleW((std::filesystem::path(exe).parent_path()/L"d3d11.dll").c_str()):nullptr;
-			MODULEINFO mi{}; const auto base=reinterpret_cast<std::uintptr_t>(mod);
-			// Verified game-directory wrapper calls: DrawIndexed -> vslot 12,
-			// Draw -> vslot 13. Reject other builds instead of guessing offsets.
-			constexpr unsigned char producer[]{0x48,0x8b,0x01,0x8b,0xd5,0xff,0x50,0x60};
-			constexpr unsigned char consumer[]{0x48,0x8b,0x01,0x41,0x8d,0x50,0x06,0xff,0x50,0x68};
-			if(!mod || !K32GetModuleInformation(GetCurrentProcess(),mod,&mi,sizeof(mi)) || mi.SizeOfImage!=0x3b7000 ||
-				memcmp(reinterpret_cast<void*>(base+0x78399-sizeof(producer)),producer,sizeof(producer)) ||
-				memcmp(reinterpret_cast<void*>(base+0x78b0a-sizeof(consumer)),consumer,sizeof(consumer)) ||
-				!v || inner.Get()==outer || !bt::SystemD3D11(v) || !bt::SystemD3D11(v[12]) || !bt::SystemD3D11(v[13])) {
+			const auto enb=LocateEnbSites();
+			if(!enb.producerReturn || !v || inner.Get()==outer || !bt::SystemD3D11(v) || !bt::SystemD3D11(v[12]) || !bt::SystemD3D11(v[13])) {
 				bt::disabled=true; F4SE::log::warn("f4sr: early scene t5 wrapper/backend mismatch; leaving original pass intact");
+				SubNativeUnavailable(enb.producerReturn ? "ENB's draws do not reach a supported D3D11 backend" : "ENB's early-scene draw calls were not found in this ENB version");
 			} else {
-				bt::producerReturn=reinterpret_cast<void*>(base+0x78399); bt::consumerReturn=reinterpret_cast<void*>(base+0x78b0a);
+				bt::producerReturn=enb.producerReturn; bt::consumerReturn=enb.consumerReturn;
+				{
+					const auto backend=std::filesystem::path(bt::ModuleFile(v[12])).filename().string();
+					F4SE::log::info("f4sr: early scene: ENB's draws reach {}", backend);
+				}
 				bt::forward[12]=v[12]; bt::forward[13]=v[13];
 				if(Exchange(v+12,bt::forward[12],bt::sites[0].probe)) {
 					if(Exchange(v+13,bt::forward[13],bt::sites[1].probe)) bt::fixedTable=v;
 					else if(!Exchange(v+12,bt::sites[0].probe,bt::forward[12])) unsafeToReopen=true;
 				}
 				bt::disabled=!bt::fixedTable;
+				if(bt::disabled) SubNativeUnavailable("could not hook ENB's draw backend");
 			}
 		}
 		if(!v || v!=bt::fixedTable || v[12]!=bt::sites[0].probe || v[13]!=bt::sites[1].probe) { original(pass,technique,flag); return; }
@@ -393,6 +476,8 @@ namespace f4sr::late_trace
 		static std::uint64_t passes{}, engaged{}, producerOnly{}, none{}, multi{}, misses[6]{};
 		++passes;
 		if(scope.used) ++engaged; else if(scope.indexed) ++producerOnly; else ++none;
+		if(scope.used) { auto expected=SubNative::Pending; subNative.compare_exchange_strong(expected,SubNative::Engaged); }
+		else if(engaged==0 && passes>=600) SubNativeUnavailable("ENB's early-scene draws were never matched");
 		if(scope.indexed>1) ++multi;
 		if(!scope.used && scope.indexed) ++misses[static_cast<unsigned>(scope.miss)];
 		if(passes==1 || passes%600==0)

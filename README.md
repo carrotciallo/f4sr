@@ -7,13 +7,14 @@ Super resolution and frame generation for Fallout 4, as an F4SE plugin.
 F4SR replaces the game's TAA with a modern temporal upscaler and can add generated frames on top:
 
 - **Upscaling:** AMD FSR 3.1, AMD FSR 4.1, or Intel XeSS. Each has four render-resolution presets, from Native (AA only) down to Performance (50%).
-- **Frame generation:** FSR-FG (2X) or XeSS-FG.
+- **Frame generation:** XeSS-FG (2X–4X, default) or FSR-FG (2X).
 - **ENB compatible.** The image is upscaled before ENB's post-processing, so ENB still runs at full output resolution.
+- **ReShade compatible**, with an option to render ReShade effects before the HUD.
 - **Menu-safe.** Terminals, the Pip-Boy, VATS and other menus render correctly at reduced render resolutions.
 - **Reactive mask.** Particles, fire, glass and water are not smeared by temporal accumulation.
 - **In-game settings** through MCM. Most options apply live.
 
-> Status: **release candidate**. It is tested on one configuration only (see [Tested on](#tested-on)). Bug reports with `f4sr.log` attached are very welcome.
+> Status: **release candidate**. It is tested on a few configurations only (see [Tested on](#tested-on)). Bug reports with `f4sr.log` attached are very welcome.
 
 ## Requirements
 
@@ -45,16 +46,29 @@ The MCM page covers everything most players need:
 |---|---|
 | Upscaling | Master switch. |
 | Upscaler | FSR 3.1 / FSR 4.1 / XeSS. |
-| Render Resolution | Native (AA only), Quality (67%), Balanced (59%), Performance (50%). |
+| Render Resolution | Native (AA only), Quality (67%), Balanced (59%), Performance (50%). With ENB, see [ENB notes](#enb-notes). |
 | Sharpening | FSR's RCAS sharpening. Keep it low if ENB already sharpens. |
 | Transparency Mask | Reactive mask for transparent effects. Recommended on. Needs a restart. |
-| Frame Generation | Master switch. Best on a variable-refresh (FreeSync / G-Sync) display. |
-| Frame Generation Engine | FSR-FG or XeSS-FG. Needs a restart. |
-| XeSS-FG Multiplier | 2X / 3X / 4X. |
-| Allow Lower Render Resolutions with ENB | Allows Quality, Balanced and Performance while ENB is installed. |
+| Frame Generation | Master switch. Best on a variable-refresh (FreeSync / G-Sync) display. With XeSS-FG, turning it on the first time takes effect after a game restart; after that it switches live. |
+| Frame Generation Engine | XeSS-FG (default) or FSR-FG. Needs a restart. See [Choosing a frame-generation engine](#choosing-a-frame-generation-engine). |
+| XeSS-FG Multiplier | 2X (default) / 3X / 4X. Shown only when XeSS-FG is selected. |
+| ReShade Effects Before UI | Renders ReShade effects before the HUD instead of on top of it. See [ReShade notes](#reshade-notes). |
 | Status Panel | Small top-left panel showing: upscaler, render → output size, upscaler GPU time, mask, and FG real → shown rate. |
 
 Precedence: values saved by MCM (`Data/MCM/Settings/f4sr.ini`) override `Data/F4SE/Plugins/f4sr.ini`. The plugin ini also holds a few advanced and troubleshooting keys, and each one is documented in the file.
+
+### Choosing a frame-generation engine
+
+XeSS-FG is the default and the recommended engine. Compared with FSR-FG it gives:
+
+- **Better frame pacing.** Generated frames are spaced evenly. F4SR's FSR-FG path presents each pair in a conservative synchronous mode, which caps the real frame rate at half the refresh rate.
+- **Lower input latency,** through Intel XeLL.
+- **A cleaner image** with less ghosting around moving objects, thin detail and transparencies.
+- **2X to 4X.** FSR-FG is 2X only.
+
+XeSS-FG takes over the game's swap chain when the game starts, so it only does so when frame generation is on at launch. Players who never turn frame generation on keep the game's own swap chain. If you turn frame generation on in a running game, restart once; after that it switches live.
+
+FSR-FG stays available as a fallback, for example if XeSS-FG does not start on your system (the status panel and `f4sr.log` say why).
 
 ### Choosing a frame-generation multiplier
 
@@ -62,8 +76,16 @@ Pick the multiplier where *real FPS × multiplier* is close to your refresh rate
 
 ## ENB notes
 
+- **Lower render resolutions with ENB** (Quality, Balanced, Performance): F4SR adjusts some of ENB's own draws to the lower resolution. It finds them by their code pattern: they are found in ENB 0.420, 0.496 and 0.501 (tested in game: 0.501), and not in 0.307 or older. If they are not found, F4SR stays at native resolution (anti-aliasing only, no FPS gain), and the status panel and `f4sr.log` say so. If the image looks wrong instead (shifted, shrunk into a corner, flickering), set Render Resolution to Native (AA only) and report it with `f4sr.log` and your ENB version.
 - ENB's post-processing runs on the upscaled image. Effects that depend on scene depth get a depth buffer remapped to the output resolution.
 - At reduced render resolutions, ENB's own sharpening can make fine edges shimmer slightly. Lower ENB's sharpening, or set F4SR's Sharpening to 0, if this bothers you.
+
+## ReShade notes
+
+- ReShade works alongside ENB (ENB as `d3d11.dll`, ReShade as `dxgi.dll`). With frame generation, ReShade's effects reach every shown frame, generated ones included, under both engines.
+- **ReShade Effects Before UI** needs the ReShade build with add-on support. F4SR then renders ReShade's effects after upscaling and ENB, before the HUD, so the HUD is untouched and frame generation interpolates the effects together with the scene. It applies to FSR-FG and to frame generation off; with XeSS-FG the effects stay on top of the HUD for now.
+- With that option and frame generation on, effects fixed to the screen (borders, overlays, vignette, grain) can trail during motion. Turn the option off if you rely on such effects.
+- It replaces add-ons such as ReShade Effect Shader Toggler for this purpose. Disable those, as two add-ons choosing when effects render will conflict.
 
 ## Known issues
 
@@ -81,11 +103,11 @@ Pick the multiplier where *real FPS × multiplier* is close to your refresh rate
 
 ## Tested on
 
-- Fallout 4 1.10.163, F4SE 0.6.23, with ENB
-- AMD Radeon RX 7900 XT, 3840×2160 at 165 Hz, VRR
-- Linux, Proton, gamescope
+- Fallout 4 1.10.163, F4SE 0.6.23, with ENB, on:
+  - AMD Radeon RX 7900 XT, 3840×2160 at 165 Hz, VRR, Linux (Proton, gamescope); with and without ReShade.
+  - AMD Radeon RX 7600, Windows (user report).
 
-Reports from Windows, NVIDIA and Intel GPUs, and other resolutions are especially welcome.
+Reports from NVIDIA and Intel GPUs and other resolutions are especially welcome. XeSS-FG has not been tested on NVIDIA GPUs yet.
 
 ## Building
 
@@ -94,7 +116,7 @@ Reports from Windows, NVIDIA and Intel GPUs, and other resolutions are especiall
 - **Commands:**
   ```sh
   tools/build-f4sr.sh --staticdeps
-  tools/package.sh build-sf dist/f4sr-v1.0.0-rc.3.zip
+  tools/package.sh build-sf dist/f4sr-v1.0.0-rc.4.zip
   ```
 
 ## Credits

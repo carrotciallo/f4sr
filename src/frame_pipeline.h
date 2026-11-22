@@ -1,4 +1,6 @@
 #pragma once
+
+#include "reshade_preui.h"
 #include "reactive_mask.h"
 
 #include <d3d11.h>
@@ -41,6 +43,8 @@ namespace f4sr
 		void OnPostImagespace(void* rtManager);
 		void OnPreInterface(void* rtManager)
 		{
+			// Effects first, so the HUD-less captures carry them.
+			reshade_preui::Render(rtManager);
 			frameGen_.CaptureHudless(rtManager);
 			xefg::CaptureHudless(rtManager);
 		}

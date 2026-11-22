@@ -20,7 +20,7 @@
       "id": "iBackend:Main",
       "type": "dropdown",
       "text": "Upscaler",
-      "help": "FSR 4.1: best image quality, highest GPU cost (runs as INT8 on RDNA3). FSR 3.1: lowest cost. XeSS: Intel's upscaler, runs on any GPU. Applies when you close the menu.",
+      "help": "FSR 4.1: best image, highest GPU cost. FSR 3.1: lightest. XeSS: runs on any GPU. Applies when you close the menu.",
       "valueOptions": {
         "sourceType": "ModSettingInt",
         "options": [
@@ -34,7 +34,7 @@
       "id": "iQualityMode:Main",
       "type": "dropdown",
       "text": "Render Resolution",
-      "help": "Resolution the game renders at before upscaling, per axis. Native keeps full resolution and only replaces the game's anti-aliasing. Lower settings are faster and softer. Applies when you close the menu.",
+      "help": "Lower = more FPS, softer image. Native only replaces anti-aliasing. With ENB, use Native if the image looks wrong.",
       "valueOptions": {
         "sourceType": "ModSettingInt",
         "options": [
@@ -49,7 +49,7 @@
       "id": "fSharpness:Main",
       "type": "slider",
       "text": "Sharpening",
-      "help": "FSR's sharpening (RCAS). 0 turns it off. XeSS ignores it. If ENB also sharpens, keep this low or at 0.",
+      "help": "FSR sharpening (RCAS); 0 = off. XeSS ignores it. Keep low if ENB also sharpens.",
       "valueOptions": {
         "min": 0,
         "max": 1,
@@ -61,7 +61,7 @@
       "id": "bReactiveMask:Main",
       "type": "switcher",
       "text": "Transparency Mask",
-      "help": "Marks pixels changed by transparent effects (particles, fire, glass, water) so the upscaler does not smear or ghost them. Recommended on. Turning it on takes effect after a game restart.",
+      "help": "Stops particles, fire, glass and water from smearing. Recommended on. Turning it on needs a restart.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -74,7 +74,7 @@
       "id": "bEnableFrameGeneration:Main",
       "type": "switcher",
       "text": "Frame Generation",
-      "help": "Shows generated frames between rendered ones for smoother motion. Adds a little input latency; works best on a variable-refresh (FreeSync / G-Sync) display. Switches live. Requires upscaling (Native AA counts).",
+      "help": "Smoother motion, a little more latency. Needs upscaling. XeSS-FG: the first time needs a restart.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -83,20 +83,21 @@
       "id": "iFrameGenEngine:Main",
       "type": "dropdown",
       "text": "Frame Generation Engine",
-      "help": "FSR-FG: AMD frame generation, 2X. XeSS-FG: Intel frame generation, 2X to 4X (multiplier below). Restart the game after changing this.",
+      "help": "XeSS-FG: smoother pacing, lower latency, less ghosting, 2X-4X. FSR-FG: 2X fallback. Needs a restart.",
       "valueOptions": {
         "sourceType": "ModSettingInt",
         "options": [
           "FSR-FG (2X)",
-          "XeSS-FG (2X - 4X)"
+          "XeSS-FG (2X - 4X, recommended)"
         ]
-      }
+      },
+      "groupControl": 2
     },
     {
       "id": "iXeFGMode:Main",
       "type": "dropdown",
       "text": "XeSS-FG Multiplier",
-      "help": "Frames shown per rendered frame: 3X shows two generated frames for each real one. Pick the value where real FPS x multiplier is close to your refresh rate; going higher adds latency without adding visible frames. Applies live.",
+      "help": "Pick it so real FPS x multiplier is near your refresh rate. Higher only adds latency. Applies live.",
       "valueOptions": {
         "sourceType": "ModSettingInt",
         "options": [
@@ -104,17 +105,18 @@
           "3X",
           "4X"
         ]
-      }
+      },
+      "groupCondition": 2
     },
     {
       "type": "section",
-      "text": "ENB"
+      "text": "ReShade"
     },
     {
-      "id": "bENBSubNative:Main",
+      "id": "bReShadeBeforeUI:Main",
       "type": "switcher",
-      "text": "Allow Lower Render Resolutions with ENB",
-      "help": "Allows Quality / Balanced / Performance while ENB is installed. The image is upscaled before ENB's post-processing, so ENB still works at full resolution. Native works either way.",
+      "text": "ReShade Effects Before UI",
+      "help": "ReShade add-on build: effects go under the HUD. Not with XeSS-FG. Screen-fixed effects may trail with FG.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -127,7 +129,7 @@
       "id": "bFrameGenOverlay:Main",
       "type": "switcher",
       "text": "Status Panel",
-      "help": "Small panel in the top-left corner: upscaler, render and output resolution, upscaler GPU time, frame generation rate. Switches live.",
+      "help": "Top-left panel: upscaler, resolutions, GPU time, frame generation rate. Switches live.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -136,7 +138,7 @@
       "id": "bDebugView:Main",
       "type": "switcher",
       "text": "FSR Debug View",
-      "help": "Replaces the image with FidelityFX's debug view (motion vectors, reactive mask). For troubleshooting only.",
+      "help": "Shows FidelityFX's debug view (motion vectors, reactive mask). Troubleshooting only.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -145,7 +147,7 @@
       "id": "bForceReset:Main",
       "type": "switcher",
       "text": "Force History Reset",
-      "help": "Troubleshooting: clears the upscaler's history every frame. If ghosting disappears with this on, the problem is in the motion vectors.",
+      "help": "Clears upscaler history every frame. If ghosting goes away, report it with f4sr.log.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -154,7 +156,7 @@
       "id": "bFrameGenCapture:Main",
       "type": "switcher",
       "text": "Capture FG Sample Frames",
-      "help": "Developer diagnostic: saves a few frame-generation sample images to the game folder. May stutter briefly. Leave off.",
+      "help": "Developer diagnostic: saves frame-generation sample images. May stutter. Leave off.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }

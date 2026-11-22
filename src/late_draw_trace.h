@@ -12,6 +12,13 @@ namespace f4sr::late_trace
 	void EndMotion();
 	using EarlyPassFn = void(*)(void*, std::uint32_t, bool);
 	void RunEarlyPass(ID3D11DeviceContext* outer, ID3D11Texture2D* mainCopy, EarlyPassFn original, void* pass, std::uint32_t technique, bool flag);
+	// Lower render resolutions under ENB rely on cropping ENB's early-scene
+	// draws, located in ENB by instruction signature. Unavailable: the call
+	// sites were not found, ENB's draws do not reach a supported backend, or
+	// the crop never engaged; the pipeline then stays at native resolution.
+	enum class SubNative { Pending, Engaged, Unavailable };
+	[[nodiscard]] SubNative SubNativeState();
+	[[nodiscard]] const char* SubNativeReason();
 	void Mark(const char* boundary);
 	void End();
 }

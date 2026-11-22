@@ -14,16 +14,32 @@ namespace backend_trace {
 	const void* producerReturn{};
 	const void* consumerReturn{};
 
-	// Ignore the process-local d3d11.dll facade. Require the table and every
-	// displaced method to reside in the loaded system32 implementation.
+	// Ignore the process-local d3d11.dll facade (ENB). The table and every
+	// displaced method must reside in what ENB forwards to: the loaded
+	// system32 implementation, or a wrapper below ENB (ReShade's context
+	// proxy). ENB's call sites still call that object directly, so the return
+	// addresses the probes match are unchanged.
+	std::wstring ModuleFile(const void* at)
+	{
+		HMODULE mod{}; wchar_t path[MAX_PATH]{};
+		if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(at),&mod)) return {};
+		const auto n=GetModuleFileNameW(mod,path,MAX_PATH);
+		return n && n<MAX_PATH ? std::wstring(path) : std::wstring();
+	}
 	bool SystemD3D11(const void* at)
 	{
-		HMODULE mod{}; wchar_t path[MAX_PATH]{}, dir[MAX_PATH]{};
+		wchar_t dir[MAX_PATH]{};
 		const auto len=GetSystemDirectoryW(dir,MAX_PATH);
-		if(!len || len>=MAX_PATH || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(at),&mod)) return false;
-		const auto n=GetModuleFileNameW(mod,path,MAX_PATH);
-		return n && n<MAX_PATH && !_wcsicmp(path,(std::wstring(dir)+L"\\d3d11.dll").c_str());
+		const auto path=ModuleFile(at);
+		if(!len || len>=MAX_PATH || path.empty()) return false;
+		if(!_wcsicmp(path.c_str(),(std::wstring(dir)+L"\\d3d11.dll").c_str())) return true;
+		static const auto self=ModuleFile(reinterpret_cast<const void*>(&ModuleFile));
+		wchar_t exe[MAX_PATH]{};
+		const auto n=GetModuleFileNameW(nullptr,exe,MAX_PATH);
+		if(!n || n>=MAX_PATH) return false;
+		const auto facade=(std::filesystem::path(exe).parent_path()/L"d3d11.dll").wstring();
+		return _wcsicmp(path.c_str(),facade.c_str()) && _wcsicmp(path.c_str(),self.c_str());
 	}
 
 	template<UINT N, class... A> void ObserveDraw(Ctx* ctx,A... a)

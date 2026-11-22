@@ -13,10 +13,10 @@ namespace f4sr
 		bool enableFrameGeneration{ false };
 		// Frame-generation engine, startup-only (the XeSS-FG presenter is
 		// attached when the game creates its swap chain): 0 = FSR-FG, 1 = XeSS-FG.
-		int frameGenEngine{ 0 };
+		int frameGenEngine{ 1 };
 		// XeSS-FG generated frames per real frame: 1 = 2X, 2 = 3X, 3 = 4X.
 		// Above 1 needs the in-memory multi-frame unlock; otherwise clamped to 1.
-		int xefgInterpolations{ 3 };
+		int xefgInterpolations{ 1 };
 		bool frameGenOverlay{ false };
 		bool frameGenCapture{ false };
 		// FSR-FG diagnostic: how the generated frame is presented.
@@ -25,7 +25,7 @@ namespace f4sr
 		// same two-vblank cadence), 2 = both frames through the wrapper (the
 		// pre-fix path). Re-read from f4sr.ini while running (PluginIniInt).
 		int fgPresentPath{ 0 };
-		bool enbSubNative{ false };
+		bool enbSubNative{ true };
 		bool debugView{ false };
 		bool forceReset{ false };
 		bool mvJitterCancellation{ false };  // startup-only diagnostic control for the FSR context
@@ -50,6 +50,8 @@ namespace f4sr
 		// Reactive mask: per-pixel change between the opaque composite and the
 		// seam, passed to FSR (reactive) and XeSS (responsive pixel mask).
 		bool reactiveMask{ true };
+		// ReShade effects rendered by f4sr before the UI (reshade_preui.h).
+		bool reshadeBeforeUi{ false };
 		float reactiveScale{ 1.0f };
 		bool proxyTargets{ true };  // render-resolution proxy targets around the composite/SSLR passes
 		int colorSlot{ 4 };       // direct RendererData slots, pinned empirically;

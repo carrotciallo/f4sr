@@ -14,6 +14,7 @@
 #include "gpu_timing.h"
 #include "xefg_presenter.h"
 #include "swapchain_inner.h"
+#include "reshade_preui.h"
 
 #include <dx12/ffx_api_dx12.h>
 #include <ffx_framegeneration.h>
@@ -168,13 +169,19 @@ namespace f4sr
 		if (g_innerChain != nullptr) return;
 		DXGI_SWAP_CHAIN_DESC desc{};
 		if (FAILED(gameChain->GetDesc(&desc))) return;
-		int field = -1;
-		std::string module;
-		auto* inner = swapchain::FindInnerChain(gameChain, desc.OutputWindow, field, module);
-		if (inner == nullptr) {
-			F4SE::log::info("f4sr: FG: no swap chain wrapper found; frames are presented on the game chain");
+		const auto layers = swapchain::Stack(gameChain, desc.OutputWindow);
+		F4SE::log::info("f4sr: FG: swap chain layers: {}", swapchain::Describe(layers));
+		const int below = swapchain::BelowEnb(layers);
+		if (below < 0) {
+			// ReShade and other present-time wrappers process every presented
+			// frame, generated ones included.
+			F4SE::log::info("f4sr: FG: no ENB wrapper; both frames are presented through the game's chain");
 			return;
 		}
+		for (int i = 0; i + 1 < below; ++i)
+			F4SE::log::warn("f4sr: FG: {} sits above ENB; it runs once per game frame and its output reaches generated frames only through UI extraction",
+				layers[i].Describe());
+		auto* inner = layers[below].chain;
 		void** table = *reinterpret_cast<void***>(inner);
 		DWORD oldProtect{}, ignored{};
 		if (!VirtualProtect(&table[8], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
@@ -185,8 +192,8 @@ namespace f4sr
 		table[8] = reinterpret_cast<void*>(&InnerPresentThunk);
 		VirtualProtect(&table[8], sizeof(void*), oldProtect, &ignored);
 		g_innerChain = inner;
-		F4SE::log::info("f4sr: FG: frames are presented on the inner swap chain {:p} (wrapper field {}, {}); the wrapper's Present (ENB) runs once per game frame",
-			static_cast<void*>(inner), field, module);
+		F4SE::log::info("f4sr: FG: frames are presented on {} {:p} below ENB; ENB's Present runs once per game frame",
+			layers[below].Describe(), static_cast<void*>(inner));
 	}
 
 	bool FrameGen::Create(D3D12Interop& interop, ID3D12Device* device, IDXGISwapChain* gameChain,
@@ -626,6 +633,8 @@ namespace f4sr
 			return hr;
 		}
 		ctx->CopyResource(backBuffer.Get(), presentColor_.tex11.Get());
+		// The generated present consumed ReShade's "rendered before the UI" mark.
+		reshade_preui::SuppressPresentEffects();
 		hr = presentReal();
 		QueryPerformanceCounter(&realEnd);
 		if (frameId_ % 300 == 1) LogPairStats(chain, syncInterval, flags, generatedStart, generatedEnd, realEnd);
@@ -729,11 +738,16 @@ namespace f4sr
 			// XeSS-FG selected but not running: say so instead of showing FSR-FG counters.
 			overlay_.Draw(chain, 0, [](double seconds) {
 				static std::uint64_t srPrevious{};
-				std::string text = "#F4SR\n" + sr_status::Lines(GetSettings().enableUpscaling, seconds, srPrevious) +
-					"\n"
-					"FG\t!none active: XeSS-FG selected but not attached\n"
-					"\trestart after changing the engine,\n"
-					"\tor look for 'XeFG' errors in f4sr.log\n";
+				std::string fg;
+				if (!GetSettings().enableFrameGeneration)
+					fg = "FG\tXeSS-FG  off\n";
+				else if (!xefg::RedirectInstalled())
+					fg = "FG\t!XeSS-FG starts after a game restart\n"
+						 "\t(frame generation was off at launch)\n";
+				else
+					fg = "FG\t!none active: XeSS-FG selected but not attached\n"
+						 "\tlook for 'XeFG' errors in f4sr.log\n";
+				std::string text = "#F4SR\n" + sr_status::Lines(GetSettings().enableUpscaling, seconds, srPrevious) + "\n" + fg;
 				return std::array<std::string, 2>{ text, text };
 			});
 			return;

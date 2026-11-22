@@ -53,6 +53,7 @@ cp -- "$amd/docs/license.md" "$licenses/amd-fidelityfx-LICENSE.md"
 cp -- "$amd/3rdpartynotice.md" "$licenses/amd-fidelityfx-third-party.md"
 cp -- "$intel/LICENSE.txt" "$licenses/intel-xess-LICENSE.txt"
 cp -- "$intel/third-party-programs.txt" "$licenses/intel-xess-third-party.txt"
+cp -- "sdk/reshade/LICENSE.md" "$licenses/reshade-LICENSE.md"
 share=$build/vcpkg_installed/x64-windows-clang-staticdeps/share
 for port in fmt spdlog; do
     cp -- "$share/$port/copyright" "$licenses/$port-LICENSE.txt"

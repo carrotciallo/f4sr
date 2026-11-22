@@ -415,9 +415,19 @@ bool FramePipeline::Init(ID3D11Device* device)
 	float EffectiveRatio(const Settings& settings)
 	{
 		float want = QualityRatio(settings.qualityMode);
-		if (ENBPresent() && !settings.enbSubNative) {
-			want = 1.0f;
+		const char* note = nullptr;
+		if (ENBPresent() && want < 1.0f) {
+			if (!settings.enbSubNative) {
+				want = 1.0f;
+				note = "\t!ENB: held at Native\n\tbENBSubNative=0 in f4sr.ini\n";
+			} else if (late_trace::SubNativeState() == late_trace::SubNative::Unavailable) {
+				want = 1.0f;
+				note = "\t!ENB: held at Native\n\tsee f4sr.log\n";
+			}
 		}
+		if (sr_status::g.note.exchange(note) != note && note)
+			F4SE::log::info("f4sr: render resolution {} is held at native with ENB: {}", settings.qualityMode,
+				settings.enbSubNative ? late_trace::SubNativeReason() : "bENBSubNative=0 in f4sr.ini");
 		if (g_nativeForMenu) {
 			want = 1.0f;
 		}

@@ -2,6 +2,7 @@
 // Self-built F4SE plugin: FidelityFX SDK 2.4 (ffx-api) + D3D11/D3D12 interop.
 
 #include "menu_effects.h"
+#include "reshade_preui.h"
 #include <algorithm>
 #include "F4SE/F4SE.h"
 #include "xefg_presenter.h"
@@ -109,7 +110,10 @@ namespace f4sr
 		mcmInt("iXeFGMode", mode);
 		if (mode >= 0) s.xefgInterpolations = mode + 1;
 		mcmBool("bReactiveMask", s.reactiveMask);
-		mcmBool("bENBSubNative", s.enbSubNative);
+		mcmBool("bReShadeBeforeUI", s.reshadeBeforeUi);
+		// bENBSubNative is plugin-ini only: Native in Render Resolution covers
+		// the opt-out, and an MCM value saved by RC1-RC3 (default off) must not
+		// keep holding ENB users at native.
 		mcmBool("bDebugView", s.debugView);
 		mcmBool("bForceReset", s.forceReset);
 		mcmBool("bFrameGenOverlay", s.frameGenOverlay);
@@ -151,12 +155,12 @@ namespace f4sr
 		GetPrivateProfileStringA("f4sr", "fSharpness", "0.5", buf, sizeof(buf), ini.c_str());
 		s.sharpness = static_cast<float>(std::atof(buf));
 		s.enableFrameGeneration = GetPrivateProfileIntA("f4sr", "bEnableFrameGeneration", 0, ini.c_str()) != 0;
-		s.frameGenEngine = GetPrivateProfileIntA("f4sr", "iFrameGenEngine", 0, ini.c_str());
-		s.xefgInterpolations = GetPrivateProfileIntA("f4sr", "iXeFGInterpolations", 3, ini.c_str());
+		s.frameGenEngine = GetPrivateProfileIntA("f4sr", "iFrameGenEngine", 1, ini.c_str());
+		s.xefgInterpolations = GetPrivateProfileIntA("f4sr", "iXeFGInterpolations", 1, ini.c_str());
 		s.frameGenOverlay = GetPrivateProfileIntA("f4sr", "bFrameGenOverlay", 0, ini.c_str()) != 0;
 		s.frameGenCapture = GetPrivateProfileIntA("f4sr", "bFrameGenCapture", 0, ini.c_str()) != 0;
 		s.fgPresentPath = GetPrivateProfileIntA("f4sr", "iFGPresentPath", 0, ini.c_str());
-		s.enbSubNative = GetPrivateProfileIntA("f4sr", "bENBSubNative", 0, ini.c_str()) != 0;
+		s.enbSubNative = GetPrivateProfileIntA("f4sr", "bENBSubNative", 1, ini.c_str()) != 0;
 		s.debugView = GetPrivateProfileIntA("f4sr", "bDebugView", 0, ini.c_str()) != 0;
 		s.forceReset = GetPrivateProfileIntA("f4sr", "bForceReset", 0, ini.c_str()) != 0;
 		s.probeOnly = GetPrivateProfileIntA("f4sr", "bProbeOnly", 0, ini.c_str()) != 0;
@@ -173,6 +177,7 @@ namespace f4sr
 		s.dynResAudit = GetPrivateProfileIntA("f4sr", "bDynResAudit", 0, ini.c_str()) != 0;
 		s.uiRelayout = GetPrivateProfileIntA("f4sr", "bUiRelayout", 1, ini.c_str()) != 0;
 		s.reactiveMask = GetPrivateProfileIntA("f4sr", "bReactiveMask", 1, ini.c_str()) != 0;
+		s.reshadeBeforeUi = GetPrivateProfileIntA("f4sr", "bReShadeBeforeUI", 0, ini.c_str()) != 0;
 		{
 			char rb[32]{};
 			GetPrivateProfileStringA("f4sr", "fReactiveScale", "1.0", rb, sizeof(rb), ini.c_str());
@@ -234,6 +239,12 @@ extern "C" __declspec(dllexport) bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadIn
 	f4sr::LoadFfxRuntime();
 	f4sr::InstallHooks();
 	f4sr::menu_effects::Install();
+	{
+		HMODULE self{};
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCSTR>(&F4SEPlugin_Load), &self);
+		f4sr::reshade_preui::Install(self);
+	}
 	if (!F4SE::GetMessagingInterface()->RegisterListener([](F4SE::MessagingInterface::Message* message) {
 		if (message && message->type == F4SE::MessagingInterface::kPostPostLoad) {
 			f4sr::xefg::ReclaimSwapChainRedirect();
