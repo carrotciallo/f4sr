@@ -62,7 +62,6 @@ namespace f4sr
 	private:
 		// OnPresent stages.
 		void DumpPresentCaptures(IDXGISwapChain* chain);
-		void LogPresentViewport(IDXGISwapChain* chain);
 		void DrawOverlay(IDXGISwapChain* chain, std::uint32_t flags, bool generated);
 		bool GenerateFrame(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer);
 		void CaptureSamples(ID3D11DeviceContext* ctx);

@@ -44,6 +44,26 @@ namespace f4sr
 		// The swap chain redirect was installed at startup (XeSS-FG selected and
 		// frame generation on).
 		[[nodiscard]] bool RedirectInstalled();
+		// Path B is running: the game renders at its own size and frames are
+		// scaled to the proxy chain's (display) size.
+		[[nodiscard]] bool OutputScaling();
+		// Render-size depth copy for ReShade (ID3D12Resource*, null until the
+		// first frame) and a counter that changes whenever it is recreated.
+		[[nodiscard]] void* ReShadeDepth12(std::uint32_t& generation);
+		void RequestPathBQuality(int quality);
+		// A Path B failure after startup: Classic from the next start, error panel now.
+		void ReportPathBFailure(const char* reason);
+		void ConfirmPathBQuality();
+		[[nodiscard]] const char* PathBQualityNote();
+		// Path B: the game's (render) and the display size, once known.
+		bool PathBSizes(UINT& renderW, UINT& renderH, UINT& displayW, UINT& displayH);
+		[[nodiscard]] UINT OutputWidth();
+		[[nodiscard]] UINT OutputHeight();
+		// Path B: the display-size frame the UI is drawn on; presented
+		// instead of the game's back buffer (null: scale the back buffer).
+		void SetComposedFrame(ID3D11Texture2D* frame);
+		// Path B: HUD-less copy from a display-size frame.
+		void CaptureHudlessFrom(ID3D11DeviceContext* ctx, ID3D11Texture2D* frame);
 		// Render start of a frame (XeLL SIMULATION_END / RENDERSUBMIT_START).
 		void OnFrameStart();
 		// Before the UI draws: copies the HUD-less frame.

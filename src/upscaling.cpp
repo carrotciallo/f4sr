@@ -11,7 +11,7 @@
 namespace f4sr
 {
 	bool FfxUpscaler::Create(ID3D12Device* device, std::uint32_t maxRenderWidth, std::uint32_t maxRenderHeight,
-		std::uint32_t maxOutputWidth, std::uint32_t maxOutputHeight, int backend, bool debugView)
+		std::uint32_t maxOutputWidth, std::uint32_t maxOutputHeight, int backend, bool debugView, bool hdr, bool nonLinearColor)
 	{
 		if (!FfxRuntimeReady() || device == nullptr) {
 			return false;
@@ -37,10 +37,10 @@ namespace f4sr
 		// standard [0..1] with sky at 1.0 (not inverted): the input layer
 		// feeds the R32_FLOAT copy the community-shaders port produces.
 		// Motion vectors are UV-space, hence no display-resolution MV flag.
-		desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
-		             FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION |
-		             FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
-		             FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+		desc.flags = FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION | FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
+		// Path B upscales the finished, tonemapped (LDR) frame after ENB.
+		if (hdr) desc.flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+		if (backend == 1 && nonLinearColor) desc.flags |= FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
 		// The world draws bind unjittered motion transforms; the captured
 		// stationary field lacks the camera jitter delta. Do not subtract it twice.
 		if (GetSettings().mvJitterCancellation) desc.flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;

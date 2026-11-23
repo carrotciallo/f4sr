@@ -1,8 +1,15 @@
 #include "sr_status.h"
+#include "version.h"
 #include "xefg_presenter.h"
+#include "ui_redirect.h"
+#include "scaleform_scale.h"
+#include "frame_pipeline.h"
+#include "output_scale.h"
 #include "swapchain_inner.h"
+#include "reshade_preui.h"
 
 #include <Windows.h>
+#include <intrin.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -10,6 +17,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
+#include "frame_pipeline_detail.h"
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -52,6 +61,76 @@ namespace
 	// d3d11.dll export). Used if another plugin's hook calls back into ours.
 	CreateDeviceAndSwapChain_t g_firstCreate{ nullptr };
 	Present_t g_origPresent{ nullptr };
+	using ResizeBuffers_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+	ResizeBuffers_t g_origResizeBuffers{ nullptr };
+	using SetFullscreenState_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
+	SetFullscreenState_t g_origSetFullscreenState{ nullptr };
+
+	// The game chain lives windowed on a hidden window and the proxy chain
+	// presents on the game window, so exclusive fullscreen (bFull Screen=1)
+	// must not reach it: on Windows it would switch the display mode for the
+	// hidden chain. The game window already covers the monitor, so the
+	// result is borderless fullscreen.
+	HRESULT STDMETHODCALLTYPE SetFullscreenStateThunk(IDXGISwapChain* chain, BOOL fullscreen, IDXGIOutput* target)
+	{
+		if (fullscreen) {
+			static bool told = false;
+			if (!told) {
+				told = true;
+				F4SE::log::info("f4sr: XeFG: exclusive fullscreen request on the game chain kept windowed (runs as borderless fullscreen)");
+			}
+			return S_OK;
+		}
+		return g_origSetFullscreenState(chain, fullscreen, target);
+	}
+	UINT g_gameWidth{}, g_gameHeight{};  // bootstrap size of the game chain on the 1x1 hidden window
+	struct RenderSize
+	{
+		UINT width{}, height{};
+		bool operator==(const RenderSize&) const = default;
+	};
+	struct PathBResizeAttempt
+	{
+		IDXGISwapChain* chain;
+		HWND window;
+		UINT width, height;
+		unsigned calls{};
+		HRESULT result{ E_UNEXPECTED };
+	};
+	thread_local PathBResizeAttempt* tl_resizeAttempt{};
+	IDXGISwapChain* g_gameChainForResize{};  // the game chain whose ResizeBuffers is redirected
+	std::atomic<std::uint64_t> g_latchedRenderSize{};  // width in high word, height in low word
+
+	RenderSize CurrentRenderSize()
+	{
+		// Input/window hooks may run off the render thread. Publish both
+		// dimensions together after a resize, never as separate live values.
+		if (const auto size = g_latchedRenderSize.load(std::memory_order_acquire))
+			return { static_cast<UINT>(size >> 32), static_cast<UINT>(size) };
+		return { g_gameWidth, g_gameHeight };
+	}
+
+	// ResizeBuffers(0, 0) sizes the buffers from the output window, which for
+	// the game chain is the 1x1 hidden window. Keep the game's own size.
+	HRESULT STDMETHODCALLTYPE ResizeBuffersThunk(IDXGISwapChain* chain, UINT count, UINT w, UINT h, DXGI_FORMAT format, UINT flags)
+	{
+		if (auto* attempt = tl_resizeAttempt; attempt && chain == attempt->chain && !w && !h) {
+			++attempt->calls;
+			attempt->result = g_origResizeBuffers(chain, count, attempt->width, attempt->height, format, flags);
+			F4SE::log::info("f4sr: Path B: game chain ResizeBuffers {}x{} hr=0x{:08X}",
+				attempt->width, attempt->height, static_cast<std::uint32_t>(attempt->result));
+			return attempt->result;
+		}
+		// Without ENB the patched vtable is ReShade's wrapper class, which
+		// also wraps the XeFG output chain: leave every other chain alone.
+		if (chain != g_gameChainForResize) return g_origResizeBuffers(chain, count, w, h, format, flags);
+		const auto size = CurrentRenderSize();
+		const UINT rw = w ? w : size.width, rh = h ? h : size.height;
+		static std::uint32_t logged = 0;
+		if (logged++ < 8)
+			F4SE::log::info("f4sr: XeFG: game chain ResizeBuffers {}x{} -> {}x{} (format {})", w, h, rw, rh, static_cast<unsigned>(format));
+		return g_origResizeBuffers(chain, count, rw, rh, format, flags);
+	}
 	bool g_redirectUsed{ false };
 	bool g_redirectInstalled{ false };
 
@@ -70,6 +149,7 @@ namespace
 	// ScreenToClient on it. Its own imports of those are redirected so the
 	// real game window counts as the hidden one.
 	HWND g_focusReal{}, g_focusHidden{};
+	UINT g_focusRenderW{}, g_focusRenderH{};
 	decltype(&GetForegroundWindow) g_origGetForeground{};
 	decltype(&GetActiveWindow) g_origGetActive{};
 	decltype(&ScreenToClient) g_origScreenToClient{};
@@ -85,12 +165,22 @@ namespace
 	}
 	BOOL WINAPI ScreenToClientHook(HWND hwnd, LPPOINT point)
 	{
-		return g_origScreenToClient(hwnd && hwnd == g_focusHidden ? g_focusReal : hwnd, point);
+		if (!hwnd || hwnd != g_focusHidden) return g_origScreenToClient(hwnd, point);
+		const BOOL ok = g_origScreenToClient(g_focusReal, point);
+		RECT r{};
+		if (ok && g_focusRenderW && g_focusRenderH && GetClientRect(g_focusReal, &r) && r.right > 0 && r.bottom > 0) {
+			const auto size = CurrentRenderSize();
+			point->x = MulDiv(point->x, static_cast<int>(size.width), r.right);
+			point->y = MulDiv(point->y, static_cast<int>(size.height), r.bottom);
+		}
+		return ok;
 	}
-	void RedirectWrapperFocus(HMODULE wrapper, HWND real, HWND hidden)
+	void RedirectWrapperFocus(HMODULE wrapper, HWND real, HWND hidden, UINT renderW, UINT renderH)
 	{
 		g_focusReal = real;
 		g_focusHidden = hidden;
+		g_focusRenderW = renderW;
+		g_focusRenderH = renderH;
 		int patched = 0;
 		auto patch = [&](const char* name, void* hook, auto& original) {
 			auto* slot = reinterpret_cast<std::uintptr_t*>(REL::GetIATAddr(reinterpret_cast<REX::W32::HMODULE>(wrapper), "USER32.dll", name));
@@ -161,8 +251,14 @@ namespace
 				} else {
 					const auto last = g_lastPresentDone.load(std::memory_order_relaxed);
 					if (last && now - last > 5000 && !idleReported) {
-						F4SE::log::warn("f4sr: XeFG watchdog: no game Present for {} ms (presents completed {}); the stall is outside the XeFG present path",
-							now - last, g_presentsDone.load());
+						// The first Presents are followed by the engine's startup
+						// loading; a pause there is expected, not a stall.
+						const auto done = g_presentsDone.load();
+						if (done < 10)
+							F4SE::log::info("f4sr: XeFG watchdog: no game Present for {} ms during startup (presents completed {})", now - last, done);
+						else
+							F4SE::log::warn("f4sr: XeFG watchdog: no game Present for {} ms (presents completed {}); the stall is outside the XeFG present path",
+								now - last, done);
 						idleReported = true;
 					} else if (last && now - last <= 5000) {
 						idleReported = false;
@@ -269,6 +365,378 @@ namespace
 		return result >= 0;
 	}
 
+	UINT g_displayWidth{}, g_displayHeight{};  // Path B output (window) size, once known
+
+	// Set when Path B failed before any of its hooks were installed: this
+	// session runs the Classic pipeline instead.
+	std::atomic<bool> g_pathBOff{};
+
+	// Path B needs the proxy chain, so it runs with the XeSS-FG engine (frame
+	// generation on or off).
+	bool EnbBeforeUpscaling()
+	{
+		const auto& s = GetSettings();
+		return s.enbBeforeUpscaling && s.frameGenEngine == 1 && !g_pathBOff.load(std::memory_order_relaxed);
+	}
+
+	// Path B failure: the MCM choice switches to Classic for the next start
+	// and the error panel says so. `early`: nothing of Path B is installed yet,
+	// so this session continues on the Classic pipeline.
+	void FallBackFromPathB(const char* reason, bool early)
+	{
+		static std::atomic<bool> reported{};
+		if (reported.exchange(true)) return;
+		if (early) {
+			// Window, cursor, INI and Scaleform hooks may already be in place;
+			// they check g_pathBOff and pass everything through from now on.
+			g_pathBOff = true;
+			if (g_displayWidth && g_displayHeight) {
+				if (auto* sw = RE::GetINISetting("iSize W:Display")) sw->SetInt(static_cast<int>(g_displayWidth));
+				if (auto* sh = RE::GetINISetting("iSize H:Display")) sh->SetInt(static_cast<int>(g_displayHeight));
+			}
+		}
+		F4SE::log::error("f4sr: UI native pipeline (Path B) failed: {}; {}", reason,
+			early ? "this session uses the Classic pipeline" : "restart the game, the next start uses the Classic pipeline");
+		WriteMcmValue("iPipeline", "0");
+		WriteMcmValue("bPipelineFellBack", "1");
+		sr_status::Raise(early ? sr_status::kAlertPipelineEarly : sr_status::kAlertPipeline);
+	}
+
+	// Path B: the game's window is created at iSize before plugins load, and
+	// under gamescope a later resize reaches Win32 but not the presented
+	// surface. So iSize stays at the display size (the window), and at plugin
+	// load, before the renderer exists, the in-memory iSize is lowered to the
+	// render size: the swap chain and every engine target follow it.
+
+	float RenderRatio(int mode)
+	{
+		switch (mode) {
+		case 1: return 1.0f / 1.5f;
+		case 2: return 1.0f / 1.7f;
+		case 3: return 1.0f / 2.0f;
+		default: return 1.0f;
+		}
+	}
+
+	bool ShrinkGameSize(const char* when)
+	{
+		if (g_displayWidth) return true;
+		auto* prefs = RE::INIPrefSettingCollection::GetSingleton();
+		auto* ini = RE::INISettingCollection::GetSingleton();
+		auto* sw = RE::GetINISetting("iSize W:Display");
+		auto* sh = RE::GetINISetting("iSize H:Display");
+		if (!sw || !sh) {
+			// The plugin-load attempt usually runs before the INI collections
+			// exist; swap chain creation retries, and only that one is an error.
+			const bool final = std::strcmp(when, "swap chain creation") == 0;
+			if (final)
+				F4SE::log::error("f4sr: ENB before upscaling ({}): iSize settings not found (prefs collection {:p}, ini collection {:p}, W {:p}, H {:p})",
+					when, static_cast<void*>(prefs), static_cast<void*>(ini), static_cast<void*>(sw), static_cast<void*>(sh));
+			else
+				F4SE::log::info("f4sr: ENB before upscaling ({}): iSize settings not loaded yet; retried at swap chain creation", when);
+			return false;
+		}
+		const int dw = sw->GetInt(), dh = sh->GetInt();
+		const float ratio = RenderRatio(GetSettings().qualityMode);
+		if (dw <= 0 || dh <= 0) return false;
+		g_displayWidth = static_cast<UINT>(dw);
+		g_displayHeight = static_cast<UINT>(dh);
+		if (ratio >= 1.0f) {
+			F4SE::log::info("f4sr: ENB before upscaling ({}): iSize {}x{}, ratio {:.3f}: the game renders at the display size", when, dw, dh, ratio);
+			return true;
+		}
+		const int rw = static_cast<int>(std::lround(dw * ratio)) & ~1, rh = static_cast<int>(std::lround(dh * ratio)) & ~1;
+		sw->SetInt(rw);
+		sh->SetInt(rh);
+		F4SE::log::info("f4sr: ENB before upscaling ({}): game size {}x{} -> {}x{} (ratio {:.3f}); window and output stay {}x{}", when, dw, dh, rw, rh, ratio, dw, dh);
+		return true;
+	}
+
+	// Path B: the game sees a virtual display of the game size. Fallout4.exe's
+	// own window, screen and cursor queries are answered in game-size
+	// coordinates; the real window and the proxy chain stay display-size.
+	HWND g_virtualWindow{};
+	using GetRect_t = BOOL(WINAPI*)(HWND, LPRECT);
+	using GetCursorPos_t = BOOL(WINAPI*)(LPPOINT);
+	using SetCursorPos_t = BOOL(WINAPI*)(int, int);
+	using ClipCursor_t = BOOL(WINAPI*)(const RECT*);
+	using GetClipCursor_t = BOOL(WINAPI*)(LPRECT);
+	using GetSystemMetrics_t = int(WINAPI*)(int);
+	GetRect_t g_origGetClientRect{}, g_origGetWindowRect{};
+	GetCursorPos_t g_origGetCursorPos{};
+	SetCursorPos_t g_origSetCursorPos{};
+	ClipCursor_t g_origClipCursor{};
+	GetClipCursor_t g_origGetClipCursor{};
+	GetSystemMetrics_t g_origGetSystemMetrics{};
+
+	bool Virtual(RenderSize size) { return !g_pathBOff.load(std::memory_order_relaxed) && g_virtualWindow && g_displayWidth && g_displayHeight && size.width && size.height; }
+	LONG ScaleCoordinate(LONG x, UINT from, UINT to) { return static_cast<LONG>(std::lround(static_cast<double>(x) * to / from)); }
+	LONG ToGameX(LONG x, RenderSize size) { return ScaleCoordinate(x, g_displayWidth, size.width); }
+	LONG ToGameY(LONG y, RenderSize size) { return ScaleCoordinate(y, g_displayHeight, size.height); }
+	LONG ToRealX(LONG x, RenderSize size) { return ScaleCoordinate(x, size.width, g_displayWidth); }
+	LONG ToRealY(LONG y, RenderSize size) { return ScaleCoordinate(y, size.height, g_displayHeight); }
+
+	BOOL WINAPI GetClientRectHook(HWND hwnd, LPRECT rc)
+	{
+		const BOOL ok = g_origGetClientRect(hwnd, rc);
+		if (const auto size = CurrentRenderSize(); ok && rc && Virtual(size) && hwnd == g_virtualWindow)
+			*rc = RECT{ 0, 0, ToGameX(rc->right, size), ToGameY(rc->bottom, size) };
+		return ok;
+	}
+	BOOL WINAPI GetWindowRectHook(HWND hwnd, LPRECT rc)
+	{
+		const BOOL ok = g_origGetWindowRect(hwnd, rc);
+		if (const auto size = CurrentRenderSize(); ok && rc && Virtual(size) && hwnd == g_virtualWindow)
+			*rc = RECT{ ToGameX(rc->left, size), ToGameY(rc->top, size), ToGameX(rc->right, size), ToGameY(rc->bottom, size) };
+		if (const auto* attempt = tl_resizeAttempt; ok && rc && attempt && hwnd == attempt->window) {
+			rc->right = rc->left + static_cast<LONG>(attempt->width);
+			rc->bottom = rc->top + static_cast<LONG>(attempt->height);
+		}
+		return ok;
+	}
+	BOOL WINAPI GetCursorPosHook(LPPOINT p)
+	{
+		const BOOL ok = g_origGetCursorPos(p);
+		if (const auto size = CurrentRenderSize(); ok && p && Virtual(size)) *p = POINT{ ToGameX(p->x, size), ToGameY(p->y, size) };
+		return ok;
+	}
+	BOOL WINAPI SetCursorPosHook(int x, int y)
+	{
+		const auto size = CurrentRenderSize();
+		return Virtual(size) ? g_origSetCursorPos(ToRealX(x, size), ToRealY(y, size)) : g_origSetCursorPos(x, y);
+	}
+	BOOL WINAPI ClipCursorHook(const RECT* rc)
+	{
+		const auto size = CurrentRenderSize();
+		if (!rc || !Virtual(size)) return g_origClipCursor(rc);
+		const RECT real{ ToRealX(rc->left, size), ToRealY(rc->top, size), ToRealX(rc->right, size), ToRealY(rc->bottom, size) };
+		return g_origClipCursor(&real);
+	}
+	BOOL WINAPI GetClipCursorHook(LPRECT rc)
+	{
+		const BOOL ok = g_origGetClipCursor(rc);
+		if (const auto size = CurrentRenderSize(); ok && rc && Virtual(size))
+			*rc = RECT{ ToGameX(rc->left, size), ToGameY(rc->top, size), ToGameX(rc->right, size), ToGameY(rc->bottom, size) };
+		return ok;
+	}
+	int WINAPI GetSystemMetricsHook(int index)
+	{
+		const int v = g_origGetSystemMetrics(index);
+		const auto size = CurrentRenderSize();
+		if (!Virtual(size)) return v;
+		switch (index) {
+		case SM_CXSCREEN: case SM_CXVIRTUALSCREEN: case SM_CXFULLSCREEN: case SM_CXMAXIMIZED: return ToGameX(v, size);
+		case SM_CYSCREEN: case SM_CYVIRTUALSCREEN: case SM_CYFULLSCREEN: case SM_CYMAXIMIZED: return ToGameY(v, size);
+		default: return v;
+		}
+	}
+
+	// Path B: the game's render resolution is its iSize. The game reads iSize
+	// through GetPrivateProfileIntA/StringA when it loads Fallout4Prefs.ini;
+	// answering with the render size there makes every system that sizes
+	// itself from the screen (renderer, ENB, UI) start at the render size.
+	// The value written back keeps the player's display size.
+	using GetProfileInt_t = UINT(WINAPI*)(LPCSTR, LPCSTR, INT, LPCSTR);
+	using GetProfileString_t = DWORD(WINAPI*)(LPCSTR, LPCSTR, LPCSTR, LPSTR, DWORD, LPCSTR);
+	using WriteProfileString_t = BOOL(WINAPI*)(LPCSTR, LPCSTR, LPCSTR, LPCSTR);
+	GetProfileInt_t g_origGetProfileInt{};
+	GetProfileString_t g_origGetProfileString{};
+	WriteProfileString_t g_origWriteProfileString{};
+
+	int SizeKey(LPCSTR key)  // 1 = width, 2 = height
+	{
+		if (!key || (reinterpret_cast<std::uintptr_t>(key) >> 16) == 0) return 0;
+		if (_stricmp(key, "iSize W") == 0) return 1;
+		if (_stricmp(key, "iSize H") == 0) return 2;
+		return 0;
+	}
+
+	UINT RenderValue(int which, UINT display)
+	{
+		if (display == 0 || g_pathBOff.load(std::memory_order_relaxed)) return display;
+		if (const auto size = g_latchedRenderSize.load(std::memory_order_acquire))
+			return which == 1 ? static_cast<UINT>(size >> 32) : static_cast<UINT>(size);
+		const float ratio = RenderRatio(GetSettings().qualityMode);
+		const UINT render = ratio >= 1.0f ? display : (static_cast<UINT>(std::lround(display * ratio)) & ~1u);
+		if (render != display) {
+			if (which == 1) { g_displayWidth = display; g_gameWidth = render; }
+			else { g_displayHeight = display; g_gameHeight = render; }
+		}
+		static int logged = 0;
+		if (logged++ < 4) F4SE::log::info("f4sr: ENB before upscaling: Fallout4Prefs {} = {} read as {}", which == 1 ? "iSize W" : "iSize H", display, render);
+		return render;
+	}
+
+	UINT WINAPI GetProfileIntHook(LPCSTR section, LPCSTR key, INT def, LPCSTR file)
+	{
+		const UINT v = g_origGetProfileInt(section, key, def, file);
+		const int which = SizeKey(key);
+		return which ? RenderValue(which, v) : v;
+	}
+
+	DWORD WINAPI GetProfileStringHook(LPCSTR section, LPCSTR key, LPCSTR def, LPSTR out, DWORD size, LPCSTR file)
+	{
+		const DWORD n = g_origGetProfileString(section, key, def, out, size, file);
+		const int which = SizeKey(key);
+		if (!which || !out || n == 0) return n;
+		char* end{};
+		const unsigned long display = std::strtoul(out, &end, 10);
+		if (end == out || display == 0) return n;
+		const auto text = std::to_string(RenderValue(which, static_cast<UINT>(display)));
+		if (text.size() + 1 > size) return n;
+		std::memcpy(out, text.c_str(), text.size() + 1);
+		return static_cast<DWORD>(text.size());
+	}
+
+	BOOL WINAPI WriteProfileStringHook(LPCSTR section, LPCSTR key, LPCSTR value, LPCSTR file)
+	{
+		const int which = SizeKey(key);
+		const UINT display = which == 1 ? g_displayWidth : which == 2 ? g_displayHeight : 0;
+		if (which && display && value) {
+			const auto text = std::to_string(display);
+			return g_origWriteProfileString(section, key, text.c_str(), file);
+		}
+		return g_origWriteProfileString(section, key, value, file);
+	}
+
+	// The game window is display-size; its size messages and client mouse
+	// coordinates are given to the game in render-size units.
+	WNDPROC g_gameWndProc{};
+	LRESULT CALLBACK GameWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+	{
+		if (g_displayWidth && g_displayHeight && !g_pathBOff.load(std::memory_order_relaxed)) {
+			const auto size = CurrentRenderSize();
+			const UINT rw = size.width ? size.width : static_cast<UINT>(std::lround(g_displayWidth * RenderRatio(GetSettings().qualityMode))) & ~1u;
+			const UINT rh = size.height ? size.height : static_cast<UINT>(std::lround(g_displayHeight * RenderRatio(GetSettings().qualityMode))) & ~1u;
+			auto scale = [&](LPARAM l) {
+				const int x = static_cast<short>(LOWORD(l)), y = static_cast<short>(HIWORD(l));
+				return MAKELPARAM(static_cast<int>(std::lround(static_cast<double>(x) * rw / g_displayWidth)),
+					static_cast<int>(std::lround(static_cast<double>(y) * rh / g_displayHeight)));
+			};
+			switch (msg) {
+			case WM_SIZE:
+				lp = scale(lp);
+				break;
+			case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+			case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+			case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+			case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+				lp = scale(lp);
+				break;
+			default: break;
+			}
+		}
+		return CallWindowProcA(g_gameWndProc, hwnd, msg, wp, lp);
+	}
+
+	// Path B: the game reads iSize for its window right after loading its INI
+	// files, before the renderer and the UI are set up. That window creation is
+	// the point to lower iSize in memory (everything initialised later follows
+	// it) and to create the window at the display size instead.
+	using CreateWindowExA_t = HWND(WINAPI*)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+	using SetWindowPos_t = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
+	CreateWindowExA_t g_origCreateWindowA{};
+	SetWindowPos_t g_origSetWindowPos{};
+	HWND g_gameWindow{};
+
+	bool DisplayFromMonitor(int& x, int& y, int& w, int& h)
+	{
+		MONITORINFO mi{ sizeof(mi) };
+		if (!GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi)) return false;
+		x = mi.rcMonitor.left;
+		y = mi.rcMonitor.top;
+		w = g_displayWidth ? static_cast<int>(g_displayWidth) : mi.rcMonitor.right - mi.rcMonitor.left;
+		h = g_displayHeight ? static_cast<int>(g_displayHeight) : mi.rcMonitor.bottom - mi.rcMonitor.top;
+		return true;
+	}
+
+	HWND WINAPI CreateWindowExAHook(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param)
+	{
+		static int calls = 0;
+		const bool topLevel = !parent && !(style & WS_CHILD);
+		const bool first = topLevel && !g_gameWindow;
+		if (calls++ < 8)
+			F4SE::log::info("f4sr: ENB before upscaling: CreateWindowExA #{} class '{}' title '{}' style 0x{:X} {}x{} at {},{} parent {:p}", calls,
+				(reinterpret_cast<std::uintptr_t>(cls) >> 16) ? cls : "(atom)", name ? name : "", style, w, h, x, y, static_cast<void*>(parent));
+		if (first) {
+			int dx{}, dy{}, dw{}, dh{};
+			if (g_displayWidth && DisplayFromMonitor(dx, dy, dw, dh)) {
+				x = dx;
+				y = dy;
+				w = dw;
+				h = dh;
+				F4SE::log::info("f4sr: ENB before upscaling: game window created at {}x{}", w, h);
+			}
+		}
+		HWND hwnd = g_origCreateWindowA(ex, cls, name, style, x, y, w, h, parent, menu, inst, param);
+		if (first && hwnd) {
+			g_gameWindow = hwnd;
+			g_virtualWindow = hwnd;
+			g_gameWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrA(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&GameWindowProc)));
+			F4SE::log::info("f4sr: ENB before upscaling: game window {:p} subclassed ({})", static_cast<void*>(hwnd), g_gameWndProc ? "ok" : "failed");
+		}
+		return hwnd;
+	}
+
+	BOOL WINAPI SetWindowPosHook(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags)
+	{
+		if (hwnd && hwnd == g_gameWindow && g_displayWidth && !g_pathBOff.load(std::memory_order_relaxed) && !(flags & SWP_NOSIZE)) {
+			int dx{}, dy{}, dw{}, dh{};
+			if (DisplayFromMonitor(dx, dy, dw, dh)) {
+				static int logged = 0;
+				if (logged++ < 4) F4SE::log::info("f4sr: ENB before upscaling: game SetWindowPos {}x{} -> {}x{}", cx, cy, dw, dh);
+				x = dx;
+				y = dy;
+				cx = dw;
+				cy = dh;
+				flags &= ~static_cast<UINT>(SWP_NOMOVE);
+			}
+		}
+		return g_origSetWindowPos(hwnd, after, x, y, cx, cy, flags);
+	}
+
+	void InstallVirtualDisplay()
+	{
+		g_origGetClientRect = reinterpret_cast<GetRect_t>(REL::PatchIAT(&GetClientRectHook, "user32.dll", "GetClientRect"));
+		g_origGetWindowRect = reinterpret_cast<GetRect_t>(REL::PatchIAT(&GetWindowRectHook, "user32.dll", "GetWindowRect"));
+		g_origGetCursorPos = reinterpret_cast<GetCursorPos_t>(REL::PatchIAT(&GetCursorPosHook, "user32.dll", "GetCursorPos"));
+		g_origSetCursorPos = reinterpret_cast<SetCursorPos_t>(REL::PatchIAT(&SetCursorPosHook, "user32.dll", "SetCursorPos"));
+		g_origClipCursor = reinterpret_cast<ClipCursor_t>(REL::PatchIAT(&ClipCursorHook, "user32.dll", "ClipCursor"));
+		g_origGetClipCursor = reinterpret_cast<GetClipCursor_t>(REL::PatchIAT(&GetClipCursorHook, "user32.dll", "GetClipCursor"));
+		g_origGetSystemMetrics = reinterpret_cast<GetSystemMetrics_t>(REL::PatchIAT(&GetSystemMetricsHook, "user32.dll", "GetSystemMetrics"));
+		const bool all = g_origGetClientRect && g_origGetWindowRect && g_origGetCursorPos && g_origSetCursorPos && g_origClipCursor && g_origGetClipCursor && g_origGetSystemMetrics;
+		F4SE::log::info("f4sr: ENB before upscaling: virtual display hooks {}", all ? "installed" : "INCOMPLETE");
+		if (!all) {
+			// Restore whatever was patched; a partial virtual display is worse than none.
+			if (g_origGetClientRect) REL::PatchIAT(g_origGetClientRect, "user32.dll", "GetClientRect");
+			if (g_origGetWindowRect) REL::PatchIAT(g_origGetWindowRect, "user32.dll", "GetWindowRect");
+			if (g_origGetCursorPos) REL::PatchIAT(g_origGetCursorPos, "user32.dll", "GetCursorPos");
+			if (g_origSetCursorPos) REL::PatchIAT(g_origSetCursorPos, "user32.dll", "SetCursorPos");
+			if (g_origClipCursor) REL::PatchIAT(g_origClipCursor, "user32.dll", "ClipCursor");
+			if (g_origGetClipCursor) REL::PatchIAT(g_origGetClipCursor, "user32.dll", "GetClipCursor");
+			if (g_origGetSystemMetrics) REL::PatchIAT(g_origGetSystemMetrics, "user32.dll", "GetSystemMetrics");
+			g_origGetClientRect = nullptr;
+		}
+	}
+
+	// Path B: the engine sizes viewports (scene, Scaleform) from its record of
+	// the window, which is the display size. Keep that record at the game size.
+	void KeepEngineWindowSize(const char* when)
+	{
+		if (!g_displayWidth) return;
+		auto* rd = RE::BSGraphics::RendererData::GetSingleton();
+		if (!rd) return;
+		auto& rw = rd->renderWindow[0];
+		const auto size = CurrentRenderSize();
+		const int gw = static_cast<int>(size.width), gh = static_cast<int>(size.height);
+		if (!gw || !gh || (rw.windowWidth == gw && rw.windowHeight == gh)) return;
+		static std::uint32_t logged = 0;
+		if (logged++ < 8)
+			F4SE::log::info("f4sr: ENB before upscaling ({}): engine window record {}x{} -> {}x{}", when, rw.windowWidth, rw.windowHeight, gw, gh);
+		rw.windowWidth = gw;
+		rw.windowHeight = gh;
+	}
+
 	DXGI_FORMAT NonSrgb(DXGI_FORMAT f)
 	{
 		switch (f) {
@@ -307,9 +775,20 @@ namespace
 		ComPtr<ID3D11DeviceContext> ctx11;
 		IDXGISwapChain* gameChain{};
 		HWND realWindow{}, hiddenWindow{};
-		UINT width{}, height{};
+		UINT width{}, height{};        // the game chain (render size under Path B)
+		UINT outWidth{}, outHeight{};  // the proxy chain (display size)
+		bool scaling{};                // Path B composition, including equal-size Native AA
+		// Hot preset switching: a verified outer ENB wrapper with a hooked
+		// inner Present, or no ENB in the stack (the engine's ResizeBuffers
+		// then reaches ReShade or DXGI directly).
+		bool enbResizeSupported{};
+		output_scale::Scaler scaleBack, scaleHudless, enbDelta;
+		ComPtr<ID3D11Texture2D> composed;  // Path B: display-size frame with the UI
+		ComPtr<ID3D11Texture2D> enbBefore; // the render-size buffer snapshotted for this wrapper Present
 		DXGI_FORMAT format{};
 		SharedTexture back, hudless, depth, motion;
+		SharedTexture reshadeDepth;  // render-size depth for ReShade's DEPTH (bReShadeDepth)
+		std::atomic<std::uint32_t> reshadeDepthGeneration{};
 		bool attached{};
 		int maxInterpolations{ 1 };
 		int appliedInterpolations{ 0 };
@@ -343,7 +822,7 @@ namespace
 			if (xell) api.xellMarker(xell, id, m);
 		}
 
-		bool CreateTexture(SharedTexture& out, UINT w, UINT h, DXGI_FORMAT f)
+		bool CreateTexture(SharedTexture& out, UINT w, UINT h, DXGI_FORMAT f, bool renderTarget = false)
 		{
 			D3D11_TEXTURE2D_DESC d{};
 			d.Width = w;
@@ -352,7 +831,7 @@ namespace
 			d.Format = f;
 			d.SampleDesc.Count = 1;
 			d.Usage = D3D11_USAGE_DEFAULT;
-			d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			d.BindFlags = D3D11_BIND_SHADER_RESOURCE | (renderTarget ? D3D11_BIND_RENDER_TARGET : 0u);
 			return interop.CreateSharedTexture(d, out);
 		}
 
@@ -363,20 +842,27 @@ namespace
 			fg = nullptr;
 			xell = nullptr;
 			proxy.Reset();
+			enbBefore.Reset();
+			enbDelta = {};
 			back = {};
 			hudless = {};
 			depth = {};
 			motion = {};
+			reshadeDepth = {};
+			reshadeDepthGeneration.fetch_add(1);
 			interop.Destroy();
 			device11.Reset();
 			ctx11.Reset();
 			attached = false;
 		}
 
-		bool Attach(ID3D11Device* device, IDXGISwapChain* chain, HWND real, HWND hidden, UINT w, UINT h, DXGI_FORMAT gameFormat)
+		bool Attach(ID3D11Device* device, IDXGISwapChain* chain, HWND real, HWND hidden, UINT w, UINT h, UINT ow, UINT oh, DXGI_FORMAT gameFormat)
 		{
 			width = w;
 			height = h;
+			outWidth = ow;
+			outHeight = oh;
+			scaling = EnbBeforeUpscaling();
 			format = NonSrgb(gameFormat);
 			realWindow = real;
 			hiddenWindow = hidden;
@@ -420,8 +906,8 @@ namespace
 				return false;
 			}
 			DXGI_SWAP_CHAIN_DESC1 desc{};
-			desc.Width = width;
-			desc.Height = height;
+			desc.Width = outWidth;
+			desc.Height = outHeight;
 			desc.Format = format;
 			desc.SampleDesc.Count = 1;
 			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -442,7 +928,7 @@ namespace
 				F4SE::log::error("f4sr: XeFG: proxy swap chain (IDXGISwapChain3) unavailable");
 				return false;
 			}
-			if (!CreateTexture(back, width, height, format) || !CreateTexture(hudless, width, height, format)) {
+			if (!CreateTexture(back, outWidth, outHeight, format, scaling) || !CreateTexture(hudless, outWidth, outHeight, format, scaling)) {
 				F4SE::log::error("f4sr: XeFG: shared back buffer / HUD-less texture creation failed");
 				return false;
 			}
@@ -470,6 +956,19 @@ namespace
 			vtable[8] = reinterpret_cast<void*>(&PresentThunk);
 			DWORD ignored{};
 			VirtualProtect(&vtable[8], sizeof(void*), oldProtect, &ignored);
+			g_gameWidth = width;
+			g_gameHeight = height;
+			if (VirtualProtect(&vtable[13], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+				g_origResizeBuffers = reinterpret_cast<ResizeBuffers_t>(vtable[13]);
+				vtable[13] = reinterpret_cast<void*>(&ResizeBuffersThunk);
+				VirtualProtect(&vtable[13], sizeof(void*), oldProtect, &ignored);
+			}
+			g_gameChainForResize = chain;
+			if (!g_origSetFullscreenState && VirtualProtect(&vtable[10], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+				g_origSetFullscreenState = reinterpret_cast<SetFullscreenState_t>(vtable[10]);
+				vtable[10] = reinterpret_cast<void*>(&SetFullscreenStateThunk);
+				VirtualProtect(&vtable[10], sizeof(void*), oldProtect, &ignored);
+			}
 			gameChain = chain;
 			// Frames are taken directly below ENB and that Present is not
 			// forwarded (a second window never gets its buffers back under
@@ -485,35 +984,47 @@ namespace
 					innerTable[8] = reinterpret_cast<void*>(&InnerPresentThunk);
 					VirtualProtect(&innerTable[8], sizeof(void*), oldProtect, &ignored);
 					g_innerChain = inner;
+					enbResizeSupported = below == 1 && layers.front().Enb() && g_origResizeBuffers;
 					F4SE::log::info("f4sr: XeFG: frames are taken from {} {:p}, after ENB's Present", layers[below].Describe(), static_cast<void*>(inner));
 					if (HMODULE enb = swapchain::ModuleOf(*reinterpret_cast<void* const*>(layers[below - 1].chain)))
-						RedirectWrapperFocus(enb, real, hidden);
+						RedirectWrapperFocus(enb, real, hidden, scaling ? width : 0, scaling ? height : 0);
 				}
 			}
 			// A wrapper that also hooks the DXGI factory the XeFG output chain
-			// was created from (ReShade as dxgi.dll) runs there, on every frame
-			// the proxy presents, generated ones included. The factory's module
-			// says so without walking XeFG's own objects.
+			// was created from runs there, on every frame the proxy presents,
+			// generated ones included. ReShade also patches system32 dxgi.dll's
+			// exports, so the factory's module alone does not prove that; the
+			// effect runtime ReShade reports for the output chain does.
 			const auto factoryModule = swapchain::ModulePath(*reinterpret_cast<void* const*>(factory.Get()));
-			F4SE::log::info("f4sr: XeFG: output chain created through {}", factoryModule);
+			F4SE::log::info("f4sr: XeFG: output chain factory object from {}", factoryModule);
 			auto reportBypassed = [&](const swapchain::Layer& layer) {
-				const bool onOutput = !factoryModule.empty() && _stricmp(factoryModule.c_str(), layer.module.c_str()) == 0;
-				if (onOutput)
+				const bool sameModule = !factoryModule.empty() && _stricmp(factoryModule.c_str(), layer.module.c_str()) == 0;
+				const bool reshade = reshade_preui::IsReShadeModule(swapchain::ModuleOf(*reinterpret_cast<void* const*>(layer.chain)));
+				if (sameModule || (reshade && reshade_preui::OutputRuntimeSeen()))
 					F4SE::log::info("f4sr: XeFG: {} is skipped on the game chain but also wraps the XeFG output chain; its effects apply to every presented frame",
 						layer.Describe());
+				else if (reshade)
+					F4SE::log::warn("f4sr: XeFG: ReShade {} has no effect runtime on the XeFG output chain; its effects are not shown under XeSS-FG",
+						layer.Describe());
 				else
-					F4SE::log::warn("f4sr: XeFG: {} is bypassed: its effects and overlay are not shown under XeSS-FG (use FSR-FG for it)",
+					F4SE::log::warn("f4sr: XeFG: {} is skipped on the game chain; unless it also hooks the system DXGI factory, its effects and overlay "
+									"are not shown under XeSS-FG (FSR-FG keeps it)",
 						layer.Describe());
 			};
 			for (std::size_t i = (below > 0 ? below : 1); i + 1 < layers.size(); ++i) reportBypassed(layers[i]);
 			if (below < 0 && layers.size() > 1 && !layers[0].Enb()) reportBypassed(layers[0]);
-			if (!g_innerChain && std::any_of(layers.begin(), layers.end(), [](const swapchain::Layer& l) { return l.Enb(); }))
+			const bool anyEnb = std::any_of(layers.begin(), layers.end(), [](const swapchain::Layer& l) { return l.Enb(); });
+			if (!g_innerChain && anyEnb)
 				F4SE::log::warn("f4sr: XeFG: ENB found but no chain below it; frames are taken before ENB's Present (effects applied there are missing)");
+			if (!anyEnb && g_origResizeBuffers) enbResizeSupported = true;  // no ENB: the engine resizes the game chain directly
 			attached = true;
 			StartWatchdog();
+			if (scaling)
+				F4SE::log::info("f4sr: ENB before upscaling: game chain {}x{}, proxy chain {}x{} (pre-UI upscale; bilinear for menus and fallback)",
+					width, height, outWidth, outHeight);
 			F4SE::log::info("f4sr: XeFG attached: proxy chain {}x{} fmt={} buffers={} FLIP_DISCARD on game window {:p} (game chain on hidden window {:p}); "
 							"max generated frames {} ({}X, unlock {}), provider reports max {} (result {}); XeLL low-latency on",
-				width, height, static_cast<unsigned>(format), kProxyBuffers, static_cast<void*>(real), static_cast<void*>(hidden),
+				outWidth, outHeight, static_cast<unsigned>(format), kProxyBuffers, static_cast<void*>(real), static_cast<void*>(hidden),
 				maxInterpolations, maxInterpolations + 1, unlock.unlocked ? "applied" : ("not applied: " + unlock.failure),
 				props.maxSupportedInterpolations, static_cast<int>(propsResult));
 			return true;
@@ -634,10 +1145,10 @@ namespace
 		// panel is part of the real frame (it is not in the HUD-less copy, so
 		// XeSS-FG treats it like UI).
 		std::uint64_t overlaySr{};
-		void DrawOverlay(IDXGISwapChain* chain, const char* block)
+		void DrawOverlay(IDXGISwapChain* chain, const char* block, ID3D11Texture2D* target = nullptr)
 		{
 			overlayOff = block ? block : "-";
-			overlay.Draw(chain, 0, [this](double seconds) {
+			auto builder = [this](double seconds) {
 				auto rate = [&](std::uint64_t n, std::uint64_t o) {
 					return seconds > 0 && n >= o ? static_cast<double>(n - o) / seconds : 0.0;
 				};
@@ -646,7 +1157,7 @@ namespace
 				overlayReal = totalReal;
 				overlayPresented = totalPresented;
 				const int setting = GetSettings().xefgInterpolations;
-				std::string text = "#F4SR\n";
+				std::string text = std::string(version::kPanelTitle) + "\n";
 				text += sr_status::Lines(GetSettings().enableUpscaling, seconds, overlaySr);
 				text += "\n";
 				if (appliedInterpolations <= 0)
@@ -662,7 +1173,9 @@ namespace
 				if (lastGenResult != 0) text += std::format("\t!last generation error {}\n", lastGenResult);
 				if (GetSettings().frameGenEngine != 1) text += "\t!engine setting is FSR-FG: restart to switch\n";
 				return std::array<std::string, 2>{ text, text };
-			});
+			};
+			if (target) overlay.DrawTo(target, 0, builder);
+			else overlay.Draw(chain, 0, builder);
 		}
 
 		// One-shot diagnostic (bDiagnostics): centre 256x256 of the HUD-less copy and of the
@@ -698,9 +1211,67 @@ namespace
 			F4SE::log::info("f4sr: XeFG centre dump written: {}", name);
 		}
 
+		// Path B: the game sizes its window from iSize and may restore that size
+		// after the swap chain exists. The proxy chain needs the display size.
+		void KeepWindowSize()
+		{
+			if (!scaling || (frameId % 30) != 1) return;
+			RECT rc{};
+			if (!GetClientRect(realWindow, &rc)) return;
+			const UINT cw = static_cast<UINT>(rc.right - rc.left), ch = static_cast<UINT>(rc.bottom - rc.top);
+			if (cw == outWidth && ch == outHeight) return;
+			MONITORINFO mi{ sizeof(mi) };
+			GetMonitorInfoW(MonitorFromWindow(realWindow, MONITOR_DEFAULTTOPRIMARY), &mi);
+			SetWindowPos(realWindow, nullptr, mi.rcMonitor.left, mi.rcMonitor.top, static_cast<int>(outWidth), static_cast<int>(outHeight),
+				SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+			static std::uint32_t logged = 0;
+			if (logged++ < 10)
+				F4SE::log::info("f4sr: ENB before upscaling: game window client {}x{} at frame {}; restored to {}x{}", cw, ch, frameId, outWidth, outHeight);
+		}
+
+		void BeforeWrapperPresent()
+		{
+			if (!scaling || !composed) return;
+			// Flush any mixed UI writes into the canvas first, then let ENB
+			// run with the game's targets and render-size viewport restored.
+			ui_redirect::End();
+			D3D11_TEXTURE2D_DESC d{};
+			if (SUCCEEDED(g_innerChain->GetBuffer(0, IID_PPV_ARGS(&enbBefore))) && enbBefore)
+				enbBefore->GetDesc(&d);
+			if (d.Width != width || d.Height != height || d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 ||
+				!enbDelta.Snapshot(ctx11.Get(), enbBefore.Get())) {
+				enbBefore.Reset();
+				if (static bool warned = false; !warned) {
+					warned = true;
+					F4SE::log::warn("f4sr: ENB before upscaling: could not snapshot the render-size buffer before ENB Present");
+				}
+			}
+		}
+
+		bool CompositeWrapperPresent(ID3D11Texture2D* source)
+		{
+			if (!enbBefore) return false;
+			ui_redirect::ScopedUntracked untracked;
+			if (source == enbBefore.Get() && enbDelta.CompositeDelta(ctx11.Get(), source, composed.Get(), back.tex11.Get())) {
+				if (static bool logged = false; !logged) {
+					logged = true;
+					F4SE::log::info("f4sr: ENB before upscaling: Present changes composited over the display-size canvas");
+				}
+				return true;
+			}
+			if (static bool warned = false; !warned) {
+				warned = true;
+				F4SE::log::warn("f4sr: ENB before upscaling: could not composite Present changes; keeping the display-size canvas");
+			}
+			return false;
+		}
+
 		HRESULT OnPresent(IDXGISwapChain* chain, UINT syncInterval, UINT flags)
 		{
 			if ((flags & DXGI_PRESENT_TEST) != 0) return g_origPresent(chain, syncInterval, flags);
+			ui_redirect::End();
+			KeepWindowSize();
+			KeepEngineWindowSize("present");
 			if (auto* data = RE::BSGraphics::RendererData::GetSingleton())
 				gpu_timing::MarkAt(reinterpret_cast<ID3D11DeviceContext*>(data->context), gpu_timing::kPresent);
 			const std::uint32_t id = frameId;
@@ -719,8 +1290,14 @@ namespace
 			if (SUCCEEDED(chain->GetBuffer(0, IID_PPV_ARGS(&source))) && source) source->GetDesc(&sd);
 			if (source && sd.Width == width && sd.Height == height && interop.Healthy()) {
 				SetStep(Step::Copy, id);
-				if (GetSettings().frameGenOverlay) DrawOverlay(chain, block);
-				ctx11->CopyResource(back.tex11.Get(), source.Get());
+				const bool fromCanvas = scaling && composed;
+				const bool panel = GetSettings().frameGenOverlay || sr_status::PanelForced();
+				if (panel && !fromCanvas) DrawOverlay(chain, block);
+				if (fromCanvas) {
+					if (!CompositeWrapperPresent(source.Get())) ctx11->CopyResource(back.tex11.Get(), composed.Get());
+					if (panel) DrawOverlay(chain, block, back.tex11.Get());
+				} else if (scaling) scaleBack.Scale(ctx11.Get(), source.Get(), back.tex11.Get());
+				else ctx11->CopyResource(back.tex11.Get(), source.Get());
 				if (GetSettings().diagnostics && !block && hudlessReady && ++centreDumpFrames >= 600 && centreDumpFrames < 604) {
 					DumpCentre(hudless.tex11.Get(), id, "hudless");
 					DumpCentre(back.tex11.Get(), id, "final");
@@ -736,7 +1313,7 @@ namespace
 					D3D12Interop::Transition(list, back.res12.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 					D3D12Interop::Transition(list, target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
 					if (!block) {
-						Tag(list, id, XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, hudless.res12.Get(), width, height);
+						Tag(list, id, XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, hudless.res12.Get(), outWidth, outHeight);
 						Tag(list, id, XEFG_SWAPCHAIN_RES_DEPTH, depth.res12.Get(), inputs.renderWidth, inputs.renderHeight);
 						Tag(list, id, XEFG_SWAPCHAIN_RES_MOTION_VECTOR, motion.res12.Get(), inputs.renderWidth, inputs.renderHeight);
 						xefg_swapchain_frame_constant_data_t c{};
@@ -789,7 +1366,7 @@ namespace
 				Marker(id, XELL_PRESENT_END);
 				static std::uint64_t warned = 0;
 				if ((warned++ % 600) == 0)
-					F4SE::log::warn("f4sr: XeFG frame {} not presented on the proxy chain (back buffer {}x{} vs proxy {}x{}, interop {})", id, sd.Width, sd.Height,
+					F4SE::log::warn("f4sr: XeFG frame {} not presented on the proxy chain (back buffer {}x{} vs game chain {}x{}, interop {})", id, sd.Width, sd.Height,
 						width, height, interop.Healthy() ? "ok" : "failed");
 			}
 			inputsReady = hudlessReady = false;
@@ -817,11 +1394,254 @@ namespace
 			if (done <= 5) F4SE::log::info("f4sr: XeFG present {} completed (frame {})", done, id);
 			Marker(frameId, XELL_SIMULATION_START);
 			simStarted = true;
+			if (scaling) Pipeline().AfterPresentPathB();
 			return hr;
 		}
 	};
 
 	Presenter g_presenter;
+
+	using NativeRendererFn = void (*)(RE::BSGraphics::Renderer*, std::uint32_t);
+	NativeRendererFn g_nativeBegin{}, g_nativeResize{};
+	std::atomic<DWORD> g_presentThread{};
+	thread_local std::uint32_t tl_resizeFrame{};
+	thread_local std::uint64_t tl_resizeTick{};
+
+	struct QualityRebuild
+	{
+		int previousQuality;
+		RenderSize previousSize;
+		std::uint64_t gameplayMs{};
+		std::uint64_t lastTick{};
+	};
+	std::optional<int> g_requestedQuality;
+	std::optional<QualityRebuild> g_qualityRebuild;
+	bool g_resizeBlocked{};
+	// All transaction state is render-thread-only, except the status text.
+	std::atomic<const char*> g_qualityNote{};
+	constexpr auto kWaitForGameplay = "\tPath B preset queued; return to gameplay\n";
+	constexpr auto kRebuilding = "\tPath B: rebuilding super resolution\n";
+	constexpr auto kRestored = "\t!Path B preset failed; previous resolution restored\n";
+	constexpr auto kRestartRequired = "\t!Path B preset not applied; restart the game\n";
+
+	RenderSize InnerBufferSize()
+	{
+		// Below ENB when there is one; otherwise the game chain itself.
+		auto* chain = g_innerChain ? g_innerChain : g_presenter.gameChain;
+		ComPtr<ID3D11Texture2D> buffer;
+		if (!chain || FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&buffer))) || !buffer) return {};
+		D3D11_TEXTURE2D_DESC desc{};
+		buffer->GetDesc(&desc);
+		return { desc.Width, desc.Height };  // release the reference before any resize
+	}
+
+	bool PathBTargetsMatch(const RE::BSGraphics::RendererData& data, RenderSize size)
+	{
+		return InnerBufferSize() == size && logical::SceneTargetsMatch(data, logical::ReadSceneSlots(), size.width, size.height);
+	}
+
+	void ResizeMenuCursor(RenderSize size)
+	{
+		auto* cursor = RE::MenuCursor::GetSingleton();
+		if (!cursor) return;
+		const auto left = cursor->minCursorX, top = cursor->minCursorY;
+		const auto right = cursor->maxCursorX, bottom = cursor->maxCursorY;
+		if (right <= left || bottom <= top) return;  // menu cursor not initialized yet
+		const auto remap = [](int pos, int low, int high, UINT extent) {
+			const double fraction = static_cast<double>(std::clamp(pos, low, high) - low) / (high - low);
+			return static_cast<std::int32_t>(std::lround(fraction * extent));
+		};
+		// The engine initializes these bounds to [0, screenWidth/Height] once.
+		// Per-menu constraints live in separate percentage fields; leave them
+		// intact. Do not call the centering setter or warp the OS pointer.
+		cursor->cursorPosX = remap(cursor->cursorPosX, left, right, size.width);
+		cursor->cursorPosY = remap(cursor->cursorPosY, top, bottom, size.height);
+		cursor->minCursorX = cursor->minCursorY = 0;
+		cursor->maxCursorX = static_cast<std::int32_t>(size.width);
+		cursor->maxCursorY = static_cast<std::int32_t>(size.height);
+		F4SE::log::info("f4sr: Path B: menu cursor bounds ({},{})-({},{}) -> (0,0)-({},{})",
+			left, top, right, bottom, size.width, size.height);
+	}
+
+	void PublishRenderSize(RE::BSGraphics::RendererWindow& window, RenderSize size)
+	{
+		auto& p = g_presenter;
+		const bool changed = RenderSize{ p.width, p.height } != size;
+		p.width = size.width;
+		p.height = size.height;
+		window.windowWidth = static_cast<int>(size.width);
+		window.windowHeight = static_cast<int>(size.height);
+		if (changed) ResizeMenuCursor(size);
+		g_latchedRenderSize.store((static_cast<std::uint64_t>(size.width) << 32) | size.height, std::memory_order_release);
+		if (auto* sw = RE::GetINISetting("iSize W:Display")) sw->SetInt(window.windowWidth);
+		if (auto* sh = RE::GetINISetting("iSize H:Display")) sh->SetInt(window.windowHeight);
+	}
+
+	bool RebuildEngine(RE::BSGraphics::Renderer* renderer, RenderSize size)
+	{
+		auto& window = renderer->data.renderWindow[0];
+		PathBResizeAttempt attempt{ g_presenter.gameChain, g_virtualWindow, size.width, size.height };
+		{
+			struct ClearAttempt { ~ClearAttempt() { tl_resizeAttempt = nullptr; } } clear;
+			tl_resizeAttempt = &attempt;
+			// Under the renderer lock, before Begin. The original pending-flag
+			// route also changes the real display mode, which is not wanted here.
+			g_nativeResize(renderer, 0);
+		}
+		const bool ok = attempt.calls == 1 && SUCCEEDED(attempt.result) && PathBTargetsMatch(renderer->data, size) &&
+			window.windowWidth == static_cast<int>(size.width) && window.windowHeight == static_cast<int>(size.height);
+		if (!ok) {
+			const auto actual = InnerBufferSize();
+			F4SE::log::error("f4sr: Path B: resize {}x{} verification failed (calls={}, hr=0x{:08X}, actual {}x{})",
+				size.width, size.height, attempt.calls, static_cast<std::uint32_t>(attempt.result), actual.width, actual.height);
+		}
+		return ok;
+	}
+
+	void RefuseQualityChange(const char* reason)
+	{
+		g_resizeBlocked = true;
+		g_qualityRebuild.reset();
+		g_requestedQuality.reset();
+		g_qualityNote.store(kRestartRequired, std::memory_order_relaxed);
+		sr_status::Poke();
+		F4SE::log::error("f4sr: Path B: {}; restart required", reason);
+	}
+
+	void KeepActualSizeWithoutSr(RE::BSGraphics::RendererWindow& window)
+	{
+		// Never label unverified targets as the requested preset. If the swap
+		// chain survived, allow an ordinary bilinear frame until restart.
+		const auto actual = InnerBufferSize();
+		if (actual.width && actual.height) PublishRenderSize(window, actual);
+		Pipeline().BlockPathBSr();
+	}
+
+	bool CanResizePathB(const RE::BSGraphics::RendererData& data)
+	{
+		const auto& p = g_presenter;
+		const auto& w = data.renderWindow[0];
+		return p.enbResizeSupported && !data.fullScreen && !data.appFullScreen && g_origGetWindowRect &&
+			g_virtualWindow && g_virtualWindow == p.realWindow && reinterpret_cast<HWND>(w.hwnd) == g_virtualWindow &&
+			reinterpret_cast<IDXGISwapChain*>(w.swapChain) == p.gameChain &&
+			(*reinterpret_cast<void***>(p.gameChain))[13] == reinterpret_cast<void*>(&ResizeBuffersThunk);
+	}
+
+	void ApplyPathBQuality(RE::BSGraphics::Renderer* renderer, std::uint32_t windowIndex, std::uint64_t tick)
+	{
+		auto& p = g_presenter;
+		auto& data = renderer->data;
+		auto& window = data.renderWindow[0];
+		if (g_resizeBlocked || windowIndex != 0 || data.requestWindowSizeChange || p.enbBefore || p.composed ||
+			ui_redirect::Active() || !detail::CaptureGameplay()) return;
+		bool rollback = false;
+		if (g_qualityRebuild) {
+			if (!GetSettings().enableUpscaling) xefg::ConfirmPathBQuality();
+			else {
+				auto& rebuild = *g_qualityRebuild;
+				// Count only safe gameplay time, not load screens or stalls.
+				if (rebuild.lastTick) rebuild.gameplayMs += (std::min)(tick - rebuild.lastTick, std::uint64_t{ 100 });
+				rebuild.lastTick = tick;
+				rollback = rebuild.gameplayMs >= 12'000;
+				if (!rollback) return;
+				F4SE::log::error("f4sr: Path B: super resolution did not resume; restoring the previous preset");
+			}
+		}
+		if (!rollback && !g_requestedQuality) return;
+		if (!CanResizePathB(data)) {
+			RefuseQualityChange("the current window or ENB swap chain does not support hot resize");
+			return;
+		}
+		const int oldQuality = GetSettings().qualityMode;
+		const int quality = rollback ? g_qualityRebuild->previousQuality : *g_requestedQuality;
+		const RenderSize oldSize{ p.width, p.height };
+		const float ratio = RenderRatio(quality);
+		const auto scaled = [=](UINT n) { return ratio == 1.0f ? n : static_cast<UINT>(std::lround(n * ratio)) & ~1u; };
+		const RenderSize target = rollback ? g_qualityRebuild->previousSize : RenderSize{ scaled(p.outWidth), scaled(p.outHeight) };
+		if (!rollback) g_requestedQuality.reset();
+		if (!target.width || !target.height || !PathBTargetsMatch(data, oldSize)) {
+			RefuseQualityChange("current engine targets do not match the swap chain");
+			return;
+		}
+		if (p.fgEnabled) {
+			if (!Ok(p.api.setEnabled(p.fg, 0), "disable XeFG before Path B resize")) {
+				RefuseQualityChange("could not pause frame generation");
+				return;
+			}
+			p.fgEnabled = false;
+		}
+		if (!p.interop.Drain() || !Pipeline().PreparePathBResize()) {
+			RefuseQualityChange("could not retire old GPU work");
+			return;
+		}
+		ui_redirect::ResetForResize();
+		p.scaleBack = {};
+		p.scaleHudless = {};
+		p.enbDelta = {};
+		p.hudlessReady = p.inputsReady = false;
+		p.resetNext = true;
+		Pipeline().RebindPathBSceneSlots();
+		F4SE::log::info("f4sr: Path B: {} preset {} -> {}, game/ENB {}x{} -> {}x{} (output {}x{})",
+			rollback ? "restoring" : "applying", oldQuality, quality, oldSize.width, oldSize.height,
+			target.width, target.height, p.outWidth, p.outHeight);
+		if (oldSize != target && !RebuildEngine(renderer, target)) {
+			if (!rollback && (PathBTargetsMatch(data, oldSize) || RebuildEngine(renderer, oldSize))) {
+				PublishRenderSize(window, oldSize);
+				g_qualityNote.store(kRestored, std::memory_order_relaxed);
+				sr_status::Poke();
+				F4SE::log::warn("f4sr: Path B: previous resolution {}x{} restored after failed resize", oldSize.width, oldSize.height);
+			} else {
+				KeepActualSizeWithoutSr(window);
+				RefuseQualityChange("could not restore verified engine targets");
+			}
+			return;
+		}
+		PublishRenderSize(window, target);
+		GetSettings().qualityMode = quality;
+		const auto slots = logical::ReadSceneSlots();
+		F4SE::log::info("f4sr: Path B: verified {}x{} game/ENB targets (logical slots color={}, depth={}, mv={})",
+			target.width, target.height, slots.color, slots.depth, slots.motion);
+		if (rollback) {
+			g_qualityRebuild.reset();
+			g_qualityNote.store(g_requestedQuality ? kWaitForGameplay : kRestored, std::memory_order_relaxed);
+		} else {
+			g_qualityRebuild = QualityRebuild{ oldQuality, oldSize };
+			g_qualityNote.store(kRebuilding, std::memory_order_relaxed);
+			if (!GetSettings().enableUpscaling) xefg::ConfirmPathBQuality();
+		}
+	}
+
+	void PathBRendererBegin(RE::BSGraphics::Renderer* renderer, std::uint32_t windowIndex)
+	{
+		const auto now = GetTickCount64();
+		const auto tick = std::exchange(tl_resizeTick, 0);
+		if (tick && now - tick <= 200 && g_presentThread.load(std::memory_order_acquire) == GetCurrentThreadId() &&
+			g_presenter.frameId == tl_resizeFrame && renderer && &renderer->data == RE::BSGraphics::RendererData::GetSingleton())
+			ApplyPathBQuality(renderer, windowIndex, now);
+		g_nativeBegin(renderer, windowIndex);
+	}
+
+	void InstallPathBResize()
+	{
+		if (REL::Module::get().version() != REL::Version{ 1, 10, 163, 0 }) return;
+		const auto site = REL::ID(1075087).address() + 0x3E;
+		const auto original = REL::ID(288964).address();
+		const auto resize = REL::ID(212827).address();
+		const auto calls = [](std::uintptr_t instruction, std::uintptr_t target) {
+			std::int32_t rel{};
+			std::memcpy(&rel, reinterpret_cast<const void*>(instruction + 1), sizeof(rel));
+			return *reinterpret_cast<const std::uint8_t*>(instruction) == 0xE8 && instruction + 5 + rel == target;
+		};
+		auto& tramp = F4SE::GetTrampoline();
+		if (!calls(site, original) || !calls(original + 0x91, resize) || tramp.free_size() < 32) {
+			F4SE::log::warn("f4sr: Path B: native Begin/resize call sites not verified; presets require restarting");
+			return;
+		}
+		g_nativeBegin = reinterpret_cast<NativeRendererFn>(original);
+		g_nativeResize = reinterpret_cast<NativeRendererFn>(resize);
+		tramp.write_call<5>(site, &PathBRendererBegin);
+		F4SE::log::info("f4sr: Path B: native preset switching hook installed");
+	}
 
 	HRESULT STDMETHODCALLTYPE PresentThunk(IDXGISwapChain* chain, UINT syncInterval, UINT flags)
 	{
@@ -830,12 +1650,38 @@ namespace
 			return g_origPresent(chain, syncInterval, flags);
 		struct Guard { bool& v; ~Guard() { v = false; } } guard{ inside };
 		inside = true;
-		if (!g_innerChain) return g_presenter.OnPresent(chain, syncInterval, flags);
+		if (!g_innerChain) {
+			// No ENB: the frame is taken here, and the end of this Present is
+			// the same preset-switch boundary the ENB path marks below.
+			tl_resizeTick = 0;
+			if (g_nativeBegin && g_presenter.scaling)
+				g_presentThread.store(GetCurrentThreadId(), std::memory_order_release);
+			const bool boundary = g_nativeBegin && g_presenter.scaling && g_presenter.enbResizeSupported && g_presenter.composed &&
+				detail::CaptureGameplay() && GetForegroundWindow() == g_presenter.realWindow;
+			const HRESULT hr = g_presenter.OnPresent(chain, syncInterval, flags);
+			if (boundary && SUCCEEDED(hr)) {
+				tl_resizeFrame = g_presenter.frameId;
+				tl_resizeTick = GetTickCount64();
+			}
+			return hr;
+		}
 		// Let the wrapper (ENB) run; the frame is taken in InnerPresentThunk.
+		g_presenter.BeforeWrapperPresent();
+		tl_resizeTick = 0;
+		if (g_nativeBegin && g_presenter.scaling)
+			g_presentThread.store(GetCurrentThreadId(), std::memory_order_release);
+		const bool resizeBoundary = g_nativeBegin && g_presenter.scaling && g_presenter.enbResizeSupported &&
+			g_presenter.composed && g_presenter.enbBefore && detail::CaptureGameplay() &&
+			GetForegroundWindow() == g_presenter.realWindow;
 		g_innerHit = false;
 		tl_inGamePresent = true;
 		const HRESULT hr = g_origPresent(chain, syncInterval, flags);
 		tl_inGamePresent = false;
+		g_presenter.enbBefore.Reset();
+		if (resizeBoundary && g_innerHit && SUCCEEDED(hr)) {
+			tl_resizeFrame = g_presenter.frameId;
+			tl_resizeTick = GetTickCount64();
+		}
 		if (g_innerHit) return hr;
 		static std::uint64_t missed = 0;
 		if ((missed++ % 600) == 0)
@@ -867,15 +1713,44 @@ namespace
 			return g_origCreate(adapter, driverType, software, flags, levels, levelCount, sdkVersion, desc, chain, device, level, context);
 		g_redirectUsed = true;
 		UINT w = desc->BufferDesc.Width, h = desc->BufferDesc.Height;
+		if (EnbBeforeUpscaling() && !g_displayWidth && ShrinkGameSize("swap chain creation") && g_displayWidth) {
+			if (auto* sw = RE::GetINISetting("iSize W:Display")) w = static_cast<UINT>(sw->GetInt());
+			if (auto* sh = RE::GetINISetting("iSize H:Display")) h = static_cast<UINT>(sh->GetInt());
+		}
 		if (!w || !h) {
 			RECT rc{};
 			GetClientRect(desc->OutputWindow, &rc);
 			w = static_cast<UINT>(rc.right - rc.left);
 			h = static_cast<UINT>(rc.bottom - rc.top);
 		}
+		UINT ow = w, oh = h;
+		if (EnbBeforeUpscaling()) {
+			// The game renders at its own (render) size on the hidden window; the
+			// real window and the proxy chain take the display size.
+			MONITORINFO mi{ sizeof(mi) };
+			GetMonitorInfoW(MonitorFromWindow(desc->OutputWindow, MONITOR_DEFAULTTOPRIMARY), &mi);
+			const auto& s = GetSettings();
+			ow = s.outputWidth > 0 ? static_cast<UINT>(s.outputWidth) : g_displayWidth ? g_displayWidth : static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
+			oh = s.outputHeight > 0 ? static_cast<UINT>(s.outputHeight) : g_displayHeight ? g_displayHeight : static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+			if (ow < w || oh < h) {
+				F4SE::log::warn("f4sr: ENB before upscaling: output {}x{} is smaller than the game size {}x{}; not scaling", ow, oh, w, h);
+				ow = w;
+				oh = h;
+			} else if (ow != w || oh != h) {
+				RECT before{};
+				GetWindowRect(desc->OutputWindow, &before);
+				SetWindowPos(desc->OutputWindow, nullptr, mi.rcMonitor.left, mi.rcMonitor.top, static_cast<int>(ow), static_cast<int>(oh),
+					SWP_NOZORDER | SWP_NOACTIVATE);
+				RECT after{};
+				GetClientRect(desc->OutputWindow, &after);
+				F4SE::log::info("f4sr: ENB before upscaling: game window {}x{} -> client {}x{} (output {}x{})",
+					before.right - before.left, before.bottom - before.top, after.right, after.bottom, ow, oh);
+			}
+		}
 		HWND hidden = CreateHiddenWindow(w, h);
 		if (!hidden) {
 			F4SE::log::error("f4sr: XeFG: hidden window creation failed ({}); stock swap chain", GetLastError());
+			if (EnbBeforeUpscaling()) FallBackFromPathB("hidden window creation failed", true);
 			return g_origCreate(adapter, driverType, software, flags, levels, levelCount, sdkVersion, desc, chain, device, level, context);
 		}
 		DXGI_SWAP_CHAIN_DESC redirected = *desc;
@@ -884,9 +1759,24 @@ namespace
 		redirected.BufferDesc.Width = w;
 		redirected.BufferDesc.Height = h;
 		HRESULT hr = g_origCreate(adapter, driverType, software, flags, levels, levelCount, sdkVersion, &redirected, chain, device, level, context);
-		if (SUCCEEDED(hr) && *chain && *device && g_presenter.Attach(*device, *chain, desc->OutputWindow, hidden, w, h, desc->BufferDesc.Format))
+		// bTestPathBFail=1 in f4sr.ini: simulate an attach failure under Path B
+		// to check the fallback and the error panel.
+		const bool testFail = EnbBeforeUpscaling() && PluginIniInt("bTestPathBFail", 0) != 0;
+		if (testFail) F4SE::log::warn("f4sr: bTestPathBFail=1: simulating a Path B attach failure");
+		if (!testFail && SUCCEEDED(hr) && *chain && *device && g_presenter.Attach(*device, *chain, desc->OutputWindow, hidden, w, h, ow, oh, desc->BufferDesc.Format)) {
+			if (g_origGetClientRect && g_displayWidth) {
+				g_virtualWindow = desc->OutputWindow;
+				F4SE::log::info("f4sr: ENB before upscaling: virtual display {}x{} on window {:p} (real {}x{})", g_gameWidth, g_gameHeight,
+					static_cast<void*>(g_virtualWindow), g_displayWidth, g_displayHeight);
+			}
+			KeepEngineWindowSize("swap chain creation");
 			return hr;
+		}
 		F4SE::log::error("f4sr: XeFG: attach failed (hr=0x{:08X}); recreating the stock swap chain on the game window", static_cast<std::uint32_t>(hr));
+		// The stock chain below is created with the game's own (display) size,
+		// so the engine continues on the Classic pipeline in this session.
+		if (EnbBeforeUpscaling()) FallBackFromPathB("XeSS-FG output chain could not be attached", true);
+		else sr_status::Raise(sr_status::kAlertXefg);
 		g_presenter.Teardown();
 		if (SUCCEEDED(hr)) {
 			if (context && *context) { (*context)->Release(); *context = nullptr; }
@@ -903,11 +1793,15 @@ namespace f4sr::xefg
 	void InstallSwapChainRedirect()
 	{
 		if (GetSettings().frameGenEngine != 1) return;
+		// Path B checks what it can before installing anything, so a failure
+		// here still leaves this session a working Classic pipeline.
+		if (EnbBeforeUpscaling() && !g_presenter.api.Load())
+			FallBackFromPathB("the XeSS-FG libraries could not be loaded", true);
 		// The swap chain is redirected only when XeSS-FG can actually run, so
 		// players who never use frame generation keep the game's own chain.
 		// The chain is created once at startup: turning frame generation on
 		// later needs a restart before XeSS-FG attaches.
-		if (!GetSettings().enableFrameGeneration) {
+		if (!GetSettings().enableFrameGeneration && !EnbBeforeUpscaling()) {
 			F4SE::log::info("f4sr: XeFG: frame generation is off at startup; the swap chain is left as is (turning it on needs a game restart)");
 			return;
 		}
@@ -916,13 +1810,90 @@ namespace f4sr::xefg
 		g_firstCreate = g_origCreate;
 		if (!g_origCreate) {
 			F4SE::log::error("f4sr: XeFG: d3d11.dll!D3D11CreateDeviceAndSwapChain import not found; XeSS-FG unavailable");
+			if (EnbBeforeUpscaling()) FallBackFromPathB("the swap chain creation import was not found", true);
+			else sr_status::Raise(sr_status::kAlertXefg);
 			return;
 		}
 		g_redirectInstalled = true;
 		F4SE::log::info("f4sr: XeFG: swap chain creation redirected (import of D3D11CreateDeviceAndSwapChain)");
+		if (EnbBeforeUpscaling()) {
+			g_origGetProfileInt = reinterpret_cast<GetProfileInt_t>(REL::PatchIAT(&GetProfileIntHook, "kernel32.dll", "GetPrivateProfileIntA"));
+			g_origGetProfileString = reinterpret_cast<GetProfileString_t>(REL::PatchIAT(&GetProfileStringHook, "kernel32.dll", "GetPrivateProfileStringA"));
+			g_origWriteProfileString = reinterpret_cast<WriteProfileString_t>(REL::PatchIAT(&WriteProfileStringHook, "kernel32.dll", "WritePrivateProfileStringA"));
+			F4SE::log::info("f4sr: ENB before upscaling: INI hooks int {} string {} write {}", g_origGetProfileInt ? "on" : "missing",
+				g_origGetProfileString ? "on" : "missing", g_origWriteProfileString ? "on" : "missing");
+			g_origCreateWindowA = reinterpret_cast<CreateWindowExA_t>(REL::PatchIAT(&CreateWindowExAHook, "user32.dll", "CreateWindowExA"));
+			g_origSetWindowPos = reinterpret_cast<SetWindowPos_t>(REL::PatchIAT(&SetWindowPosHook, "user32.dll", "SetWindowPos"));
+			F4SE::log::info("f4sr: ENB before upscaling: window hooks CreateWindowExA {} SetWindowPos {}", g_origCreateWindowA ? "on" : "missing", g_origSetWindowPos ? "on" : "missing");
+			InstallVirtualDisplay();
+			scaleform_scale::Install();
+			InstallPathBResize();
+		}
 	}
 
 	bool RedirectInstalled() { return g_redirectInstalled; }
+
+	bool OutputScaling() { return g_presenter.attached && g_presenter.scaling; }
+	void* ReShadeDepth12(std::uint32_t& generation)
+	{
+		generation = g_presenter.reshadeDepthGeneration.load();
+		return g_presenter.reshadeDepth.res12.Get();
+	}
+	void ReportPathBFailure(const char* reason) { FallBackFromPathB(reason, false); }
+
+	void RequestPathBQuality(int quality)
+	{
+		if (quality == GetSettings().qualityMode) {
+			g_requestedQuality.reset();
+			if (!g_qualityRebuild && !g_resizeBlocked) g_qualityNote.store(nullptr, std::memory_order_relaxed);
+			return;
+		}
+		if (g_resizeBlocked) return;
+		if (!g_nativeResize || !g_presenter.enbResizeSupported) {
+			RefuseQualityChange("native hot resize or the ENB wrapper is unavailable");
+			return;
+		}
+		if (g_requestedQuality == quality) return;
+		g_requestedQuality = quality;
+		if (!g_qualityRebuild) g_qualityNote.store(kWaitForGameplay, std::memory_order_relaxed);
+		F4SE::log::info("f4sr: Path B: MCM preset {} queued (current {})", quality, GetSettings().qualityMode);
+	}
+
+	void ConfirmPathBQuality()
+	{
+		if (!g_qualityRebuild) return;
+		const auto& p = g_presenter;
+		F4SE::log::info("f4sr: Path B: MCM preset {} active at {}x{} -> {}x{}{}", GetSettings().qualityMode,
+			p.width, p.height, p.outWidth, p.outHeight, GetSettings().enableUpscaling ? " (SR dispatched)" : " (SR disabled)");
+		g_qualityRebuild.reset();
+		g_qualityNote.store(g_requestedQuality ? kWaitForGameplay : nullptr, std::memory_order_relaxed);
+	}
+
+	const char* PathBQualityNote() { return g_qualityNote.load(std::memory_order_relaxed); }
+
+	UINT OutputWidth() { return g_presenter.outWidth; }
+
+	bool PathBSizes(UINT& renderW, UINT& renderH, UINT& displayW, UINT& displayH)
+	{
+		if (g_pathBOff.load(std::memory_order_relaxed)) return false;
+		const auto size = CurrentRenderSize();
+		renderW = size.width;
+		renderH = size.height;
+		displayW = g_displayWidth;
+		displayH = g_displayHeight;
+		return renderW && renderH && displayW && displayH;
+	}
+	UINT OutputHeight() { return g_presenter.outHeight; }
+	void SetComposedFrame(ID3D11Texture2D* frame) { g_presenter.composed = frame; }
+
+	void CaptureHudlessFrom(ID3D11DeviceContext* ctx, ID3D11Texture2D* frame)
+	{
+		auto& p = g_presenter;
+		p.hudlessReady = false;
+		if (!p.attached || !ctx || !frame || !p.hudless.tex11 || !GetSettings().enableFrameGeneration) return;
+		ctx->CopyResource(p.hudless.tex11.Get(), frame);
+		p.hudlessReady = true;
+	}
 
 	// Plugins loaded after f4sr (e.g. NVIDIA_Reflex) may re-patch the same
 	// import and call d3d11.dll directly, skipping our hook. Once every plugin
@@ -931,6 +1902,7 @@ namespace f4sr::xefg
 	void ReclaimSwapChainRedirect()
 	{
 		if (GetSettings().frameGenEngine != 1 || !g_firstCreate) return;
+		if (EnbBeforeUpscaling()) ShrinkGameSize("after plugin load");
 		auto* slot = reinterpret_cast<std::uintptr_t*>(REL::GetIATAddr("d3d11.dll", "D3D11CreateDeviceAndSwapChain"));
 		if (!slot) return;
 		const auto current = *slot;
@@ -993,7 +1965,8 @@ namespace f4sr::xefg
 		ID3D11DepthStencilView* dsv{};
 		ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
 		ctx->OMSetRenderTargets(0, nullptr, nullptr);
-		ctx->CopyResource(p.hudless.tex11.Get(), source.Get());
+		if (p.scaling) p.scaleHudless.Scale(ctx, source.Get(), p.hudless.tex11.Get());
+		else ctx->CopyResource(p.hudless.tex11.Get(), source.Get());
 		ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
 		for (auto* v : rtvs) if (v) v->Release();
 		if (dsv) dsv->Release();
@@ -1018,6 +1991,22 @@ namespace f4sr::xefg
 		}
 		const D3D11_BOX box{ 0, 0, 0, in.renderWidth, in.renderHeight, 1 };
 		ctx->CopySubresourceRegion(p.depth.tex11.Get(), 0, 0, 0, 0, in.depth, 0, &box);
+		if (reshade_preui::WantsDepth()) {
+			// Exactly the rendered region: Classic's depth is display-size with
+			// the frame in its top-left corner, and ReShade samples 0..1 UV.
+			D3D11_TEXTURE2D_DESC dd{};
+			in.depth->GetDesc(&dd);
+			auto& t = p.reshadeDepth;
+			if (!t.tex11 || t.desc.Width != in.renderWidth || t.desc.Height != in.renderHeight || t.desc.Format != dd.Format) {
+				t = {};
+				if (p.CreateTexture(t, in.renderWidth, in.renderHeight, dd.Format)) {
+					p.reshadeDepthGeneration.fetch_add(1);
+					F4SE::log::info("f4sr: ReShade depth: {}x{} format {} copy for the output runtime", in.renderWidth, in.renderHeight,
+						static_cast<unsigned>(dd.Format));
+				}
+			}
+			if (t.tex11) ctx->CopySubresourceRegion(t.tex11.Get(), 0, 0, 0, 0, in.depth, 0, &box);
+		}
 		ctx->CopySubresourceRegion(p.motion.tex11.Get(), 0, 0, 0, 0, in.motionVectors, 0, &box);
 		p.inputs = in;
 		p.inputs.depth = p.inputs.motionVectors = nullptr;

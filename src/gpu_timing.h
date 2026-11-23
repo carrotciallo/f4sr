@@ -22,12 +22,13 @@ namespace f4sr::gpu_timing
 		kPostSr,          // SR done, game imagespace + ENB post follow
 		kPostImagespace,  // RenderEffectRange returned
 		kPreInterface,    // UI starts
+		kPostCompose,     // pre-interface work done (Path B: the upscale into the canvas)
 		kPresent,         // frame handed to presentation (after ENB's Present work under XeSS-FG)
 		kMarkCount
 	};
 
 	inline constexpr const char* kSegmentNames[kMarkCount - 1]{
-		"scene", "SR", "imagespace+ENB", "post-imagespace->UI", "UI+present work"
+		"scene", "SR", "imagespace+ENB", "post-imagespace->UI", "pre-UI (Path B SR)", "UI+present work"
 	};
 
 	struct Slot
@@ -45,6 +46,7 @@ namespace f4sr::gpu_timing
 		int current{ -1 };  // slot of the frame being marked, -1 between frames
 		int next{};         // slot the next frame starts in
 		bool ready{}, failed{};
+		bool pathB{};  // the panel's SR figure includes the pre-UI segment
 		ID3D11Device* device{};
 		double sum[kMarkCount - 1]{}, total{};
 		std::uint64_t count[kMarkCount - 1]{}, frames{};
@@ -127,12 +129,15 @@ namespace f4sr::gpu_timing
 			return;
 		}
 		auto avg = [](double s, std::uint64_t n) { return n ? s / static_cast<double>(n) : 0.0; };
-		F4SE::log::info("f4sr: GPU 5s ({} frames): frame start->present {:.2f} ms = {} {:.2f} + {} {:.2f} + {} {:.2f} + {} {:.2f} + {} {:.2f} ms",
+		F4SE::log::info("f4sr: GPU 5s ({} frames): frame start->present {:.2f} ms = {} {:.2f} + {} {:.2f} + {} {:.2f} + {} {:.2f} + {} {:.2f} + {} {:.2f} ms",
 			g.frames, avg(g.total, g.frames),
 			kSegmentNames[0], avg(g.sum[0], g.count[0]), kSegmentNames[1], avg(g.sum[1], g.count[1]),
 			kSegmentNames[2], avg(g.sum[2], g.count[2]), kSegmentNames[3], avg(g.sum[3], g.count[3]),
-			kSegmentNames[4], avg(g.sum[4], g.count[4]));
-		sr_status::g.gpuMs.store(avg(g.sum[kPreImagespace], g.count[kPreImagespace]), std::memory_order_relaxed);
+			kSegmentNames[4], avg(g.sum[4], g.count[4]), kSegmentNames[5], avg(g.sum[5], g.count[5]));
+		// Path B: the seam only captures the inputs; the upscale runs before the UI.
+		const double sr = avg(g.sum[kPreImagespace], g.count[kPreImagespace]) +
+			(g.pathB ? avg(g.sum[kPreInterface], g.count[kPreInterface]) : 0.0);
+		sr_status::g.gpuMs.store(sr, std::memory_order_relaxed);
 		std::fill(std::begin(g.sum), std::end(g.sum), 0.0);
 		std::fill(std::begin(g.count), std::end(g.count), 0ull);
 		g.total = 0.0;

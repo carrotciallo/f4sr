@@ -1,4 +1,5 @@
 #include "sr_status.h"
+#include "version.h"
 #include "framegen.h"
 #include "frame_journal.h"
 #include "capture.h"
@@ -500,7 +501,6 @@ namespace f4sr
 				frame_journal::OnPresent(chain, reinterpret_cast<ID3D11DeviceContext*>(data->context));
 		}
 		if ((flags & DXGI_PRESENT_TEST) == 0) DumpPresentCaptures(chain);
-		if ((flags & DXGI_PRESENT_TEST) == 0) LogPresentViewport(chain);
 		if ((flags & DXGI_PRESENT_TEST) != 0) return PresentOn(chain, syncInterval, flags);
 		++overlaySample_.source;
 		overlaySample_.enabled = GetSettings().enableFrameGeneration;
@@ -708,30 +708,10 @@ namespace f4sr
 		}
 	}
 
-	void FrameGen::LogPresentViewport(IDXGISwapChain* chain)
-	{
-		static std::uint64_t s_presentCount = 0;
-		if ((++s_presentCount % 600) == 1) {
-			if (auto* data = RE::BSGraphics::RendererData::GetSingleton(); data != nullptr && data->context != nullptr) {
-				auto* vctx = reinterpret_cast<ID3D11DeviceContext*>(data->context);
-				UINT nvp = 8;
-				D3D11_VIEWPORT vps[8]{};
-				vctx->RSGetViewports(&nvp, vps);
-				DXGI_SWAP_CHAIN_DESC sd{};
-				chain->GetDesc(&sd);
-				F4SE::log::info("f4sr: vp present nvp={} vp0=({:.0f},{:.0f} {:.0f}x{:.0f}) bb={}x{}",
-					nvp,
-					nvp != 0 ? vps[0].TopLeftX : -1.0f, nvp != 0 ? vps[0].TopLeftY : -1.0f,
-					nvp != 0 ? vps[0].Width : -1.0f, nvp != 0 ? vps[0].Height : -1.0f,
-					sd.BufferDesc.Width, sd.BufferDesc.Height);
-			}
-		}
-	}
-
 	// Status panel on this chain (FSR-FG; XeSS-FG draws its own).
 	void FrameGen::DrawOverlay(IDXGISwapChain* chain, std::uint32_t flags, bool generated)
 	{
-		if (!GetSettings().frameGenOverlay || (flags & ~DXGI_PRESENT_ALLOW_TEARING) != 0) return;
+		if (!(GetSettings().frameGenOverlay || sr_status::PanelForced()) || (flags & ~DXGI_PRESENT_ALLOW_TEARING) != 0) return;
 		// While XeSS-FG is attached its presenter draws its own panel on this chain.
 		if (xefg::Attached()) return;
 		if (GetSettings().frameGenEngine != 0) {
@@ -747,7 +727,7 @@ namespace f4sr
 				else
 					fg = "FG\t!none active: XeSS-FG selected but not attached\n"
 						 "\tlook for 'XeFG' errors in f4sr.log\n";
-				std::string text = "#F4SR\n" + sr_status::Lines(GetSettings().enableUpscaling, seconds, srPrevious) + "\n" + fg;
+				std::string text = std::string(version::kPanelTitle) + "\n" + sr_status::Lines(GetSettings().enableUpscaling, seconds, srPrevious) + "\n" + fg;
 				return std::array<std::string, 2>{ text, text };
 			});
 			return;
@@ -769,7 +749,7 @@ namespace f4sr
 			const std::string sr = sr_status::Lines(GetSettings().enableUpscaling, seconds, srPrevious);
 			std::array<std::string, 2> text;
 			for (int i = 0; i < 2; ++i) {
-				text[i] = "#F4SR" + std::string(i ? "   [G] generated frame" : "   [R] real frame") + "\n" + sr + "\n";
+				text[i] = std::string(version::kPanelTitle) + std::string(i ? "   [G] generated frame" : "   [R] real frame") + "\n" + sr + "\n";
 				text[i] += std::string("FG\tFSR-FG 2X  ") + (now.enabled ? "generating" : "!paused") +
 					(InnerRouting() ? "  (inner chain)" : g_innerChain ? "  (via wrapper)" : "") + "\n";
 				if (!now.enabled) text[i] += std::format("\t!{}\n", now.reason);

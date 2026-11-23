@@ -8,13 +8,13 @@ F4SR replaces the game's TAA with a modern temporal upscaler and can add generat
 
 - **Upscaling:** AMD FSR 3.1, AMD FSR 4.1, or Intel XeSS. Each has four render-resolution presets, from Native (AA only) down to Performance (50%).
 - **Frame generation:** XeSS-FG (2X–4X, default) or FSR-FG (2X).
-- **ENB compatible.** The image is upscaled before ENB's post-processing, so ENB still runs at full output resolution.
-- **ReShade compatible**, with an option to render ReShade effects before the HUD.
+- **ENB compatible.** With XeSS-FG (the default), the game and ENB render at the lower render resolution and the UI is drawn at output resolution ("UI Native"). The older "Classic" pipeline upscales before ENB.
+- **ReShade compatible.** Effects can run together with ENB, before upscaling and under the HUD, with the game's depth.
 - **Menu-safe.** Terminals, the Pip-Boy, VATS and other menus render correctly at reduced render resolutions.
 - **Reactive mask.** Particles, fire, glass and water are not smeared by temporal accumulation.
 - **In-game settings** through MCM. Most options apply live.
 
-> Status: **release candidate**. It is tested on a few configurations only (see [Tested on](#tested-on)). Bug reports with `f4sr.log` attached are very welcome.
+> Status: **1.1.0-alpha.1, experimental build.** It makes the UI Native pipeline the default and adds ReShade before upscaling. The stable release is 1.0.0-rc.4; keep using it if you need a tested setup. This build was tested on Linux only (see [Tested on](#tested-on)). Bug reports with `f4sr.log` attached are very welcome.
 
 ## Requirements
 
@@ -34,7 +34,7 @@ F4SR replaces the game's TAA with a modern temporal upscaler and can add generat
 2. Start the game through F4SE.
 3. Open **MCM → F4SR**, or edit `Data/F4SE/Plugins/f4sr.ini`.
 
-When upgrading from RC1, replace the old F4SR mod and keep `Data/MCM/Settings/f4sr.ini`. This release no longer ships loose `fmt.dll` or `spdlog.dll`. Remove RC1 copies next to `Fallout4.exe` only if you know no other plugin uses them.
+When upgrading from an earlier release, replace the old F4SR mod (this experimental build uses the same files as rc.4) and keep `Data/MCM/Settings/f4sr.ini`. The new Render Pipeline option starts at UI Native. To go back to the stable release, reinstall rc.4. Releases since RC2 no longer ship loose `fmt.dll` or `spdlog.dll`; remove RC1 copies next to `Fallout4.exe` only if you know no other plugin uses them.
 
 Disable other upscaler or frame-generation mods for Fallout 4 first. Two plugins hooking the same render path will conflict.
 
@@ -46,14 +46,16 @@ The MCM page covers everything most players need:
 |---|---|
 | Upscaling | Master switch. |
 | Upscaler | FSR 3.1 / FSR 4.1 / XeSS. |
-| Render Resolution | Native (AA only), Quality (67%), Balanced (59%), Performance (50%). With ENB, see [ENB notes](#enb-notes). |
+| Render Pipeline | UI Native (default) or Classic. See [Pipelines](#pipelines). Shown only with XeSS-FG; FSR-FG always uses Classic. Needs a restart. |
+| Render Resolution | Native (AA only), Quality (67%), Balanced (59%), Performance (50%). Default: Balanced. In UI Native, return to gameplay to apply the preset; unsupported setups require a restart. |
 | Sharpening | FSR's RCAS sharpening. Keep it low if ENB already sharpens. |
 | Transparency Mask | Reactive mask for transparent effects. Recommended on. Needs a restart. |
 | Frame Generation | Master switch. Best on a variable-refresh (FreeSync / G-Sync) display. With XeSS-FG, turning it on the first time takes effect after a game restart; after that it switches live. |
 | Frame Generation Engine | XeSS-FG (default) or FSR-FG. Needs a restart. See [Choosing a frame-generation engine](#choosing-a-frame-generation-engine). |
 | XeSS-FG Multiplier | 2X (default) / 3X / 4X. Shown only when XeSS-FG is selected. |
-| ReShade Effects Before UI | Renders ReShade effects before the HUD instead of on top of it. See [ReShade notes](#reshade-notes). |
-| Status Panel | Small top-left panel showing: upscaler, render → output size, upscaler GPU time, mask, and FG real → shown rate. |
+| ReShade Effects Before UI | Renders ReShade effects under the HUD instead of on top of it. In UI Native they run together with ENB, before upscaling. See [ReShade notes](#reshade-notes). |
+| ReShade Depth | Gives ReShade the game's depth under XeSS-FG, and in Classic below Native, for ambient occlusion, depth of field, fog and similar effects. On by default. Applies live. |
+| Status Panel | Small top-left panel showing: pipeline, upscaler, render → output size, upscaler GPU time, mask, FG real → shown rate, and ReShade mode. It also appears on its own for 30 seconds when an error turns a feature off (marked ERR). |
 
 Precedence: values saved by MCM (`Data/MCM/Settings/f4sr.ini`) override `Data/F4SE/Plugins/f4sr.ini`. The plugin ini also holds a few advanced and troubleshooting keys, and each one is documented in the file.
 
@@ -66,31 +68,87 @@ XeSS-FG is the default and the recommended engine. Compared with FSR-FG it gives
 - **A cleaner image** with less ghosting around moving objects, thin detail and transparencies.
 - **2X to 4X.** FSR-FG is 2X only.
 
-XeSS-FG takes over the game's swap chain when the game starts, so it only does so when frame generation is on at launch. Players who never turn frame generation on keep the game's own swap chain. If you turn frame generation on in a running game, restart once; after that it switches live.
+With the UI Native pipeline (the default), XeSS-FG takes over the game's swap chain even with frame generation off, so frame generation switches live. With Classic, XeSS-FG takes over the swap chain only if frame generation is on at launch; if you turn it on in a running game, restart once.
 
-FSR-FG stays available as a fallback, for example if XeSS-FG does not start on your system (the status panel and `f4sr.log` say why).
+FSR-FG stays available as a fallback, for example if XeSS-FG does not start on your system (the status panel and `f4sr.log` say why). FSR-FG always uses the Classic pipeline.
 
 ### Choosing a frame-generation multiplier
 
 Pick the multiplier where *real FPS × multiplier* is close to your refresh rate. Going higher adds latency without adding visible frames. On a 165 Hz display, for example, 41 real FPS suits 4X and 55 real FPS suits 3X.
 
-## ENB notes
+## Pipelines
 
+### UI Native (default with XeSS-FG)
+
+- The game and ENB render at the render resolution. F4SR upscales the finished frame, then the game draws the UI on it at output resolution. ENB's settings overlay and late `Present` effects are carried onto the output.
+- Below Native it is faster than Classic, because ENB and ReShade also run at the render resolution. Measured on an RX 7900 XT at 3840×2160 output, FSR 4.1, ENB 0.501 and ReShade, frame generation off: Quality 68.6 vs 57.8 FPS, Balanced 74.3 vs 61.5, Performance 81.8 vs 64.6. At Native, Classic is slightly faster (48.8 vs 45.3 FPS).
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/perf-4k-dark.svg">
+    <img src="docs/images/perf-4k-light.svg" alt="Real FPS at 3840x2160: Native 45.3 UI Native vs 48.8 Classic; Quality 68.6 vs 57.8; Balanced 74.3 vs 61.5; Performance 81.8 vs 64.6" width="760">
+  </picture>
+
+- ENB's sharpening and edge effects run before upscaling, so the fine-edge shimmer that Classic can show at reduced render resolutions does not appear.
+- Upscalers: FSR 3.1, FSR 4.1 and XeSS-SR. Frame generation can be on or off.
+- **Change Render Resolution in MCM, then close the menu and return to gameplay.** In windowed/borderless mode, with ENB 0.501-compatible swap chains or without ENB, the game (and ENB) rebuild their buffers without restarting. Expect a brief pause and a few seconds while upscaling and frame generation recover. If the status panel asks for a restart, quit to desktop and relaunch through F4SE; reloading a save is not enough.
+- With 3840×2160 output, the internal resolutions are Quality **2560×1440**, Balanced **2258×1270**, and Performance **1920×1080**; Native renders at **3840×2160** and uses the selected upscaler for anti-aliasing. Keep `iSize W` and `iSize H` in `Fallout4Prefs.ini` at your output resolution.
+- `bPathBNonLinearColor` (plugin ini, on by default) tells the upscaler that the frame it reads is gamma-encoded, as SDR output with or without ENB is. Turn it off only for a preset that outputs linear color.
+- Exclusive fullscreen (`bFull Screen=1`) runs as borderless fullscreen, since the frame is presented through F4SR's own swap chain on the game window.
+- **Fallback:** if UI Native cannot start (for example, XeSS-FG cannot take over the swap chain), F4SR uses Classic for that session, switches the MCM choice to Classic and shows an error on the status panel. Select UI Native again in MCM to retry after fixing the cause.
+
+### ENB presets in UI Native
+
+ENB now runs before the upscaler, on the render-resolution frame. Most presets look the same; a few things behave differently:
+
+- **ENB's own temporal anti-aliasing** (TAA in the preset's prepass or postpass shaders) now sees the upscaler's sub-pixel camera jitter and can blur or ghost. Turn it off; the upscaler already anti-aliases.
+- **Effects sized in pixels** (sharpening radius, film grain, noise, some lens effects) are drawn at the render resolution and then upscaled, so they appear larger by the same factor as ReShade effects (see the table under [ReShade notes](#before-ui-with-ui-native)). Grain and noise may also look softer or shimmer slightly after upscaling.
+- Tested with ENB 0.501. Other versions should work, but if the image looks wrong (offset, wrong size, flickering, ENB's menu not clickable), switch Render Pipeline to Classic and report it with `f4sr.log` and your ENB version.
+- Without ENB, UI Native works the same way, including switching Render Resolution live.
+
+### Classic
+
+- Used with FSR-FG, or when chosen in MCM. F4SR upscales before ENB; ENB's post-processing runs on the upscaled image at output resolution.
 - **Lower render resolutions with ENB** (Quality, Balanced, Performance): F4SR adjusts some of ENB's own draws to the lower resolution. It finds them by their code pattern: they are found in ENB 0.420, 0.496 and 0.501 (tested in game: 0.501), and not in 0.307 or older. If they are not found, F4SR stays at native resolution (anti-aliasing only, no FPS gain), and the status panel and `f4sr.log` say so. If the image looks wrong instead (shifted, shrunk into a corner, flickering), set Render Resolution to Native (AA only) and report it with `f4sr.log` and your ENB version.
-- ENB's post-processing runs on the upscaled image. Effects that depend on scene depth get a depth buffer remapped to the output resolution.
+- Effects that depend on scene depth get a depth buffer remapped to the output resolution.
 - At reduced render resolutions, ENB's own sharpening can make fine edges shimmer slightly. Lower ENB's sharpening, or set F4SR's Sharpening to 0, if this bothers you.
 
 ## ReShade notes
 
-- ReShade works alongside ENB (ENB as `d3d11.dll`, ReShade as `dxgi.dll`). With frame generation, ReShade's effects reach every shown frame, generated ones included, under both engines.
-- **ReShade Effects Before UI** needs the ReShade build with add-on support. F4SR then renders ReShade's effects after upscaling and ENB, before the HUD, so the HUD is untouched and frame generation interpolates the effects together with the scene. It applies to FSR-FG and to frame generation off; with XeSS-FG the effects stay on top of the HUD for now.
-- With that option and frame generation on, effects fixed to the screen (borders, overlays, vignette, grain) can trail during motion. Turn the option off if you rely on such effects.
-- It replaces add-ons such as ReShade Effect Shader Toggler for this purpose. Disable those, as two add-ons choosing when effects render will conflict.
+- ReShade works alongside ENB (ENB as `d3d11.dll`, ReShade as `dxgi.dll`). **ReShade Effects Before UI** and **ReShade Depth** need the ReShade build with add-on support.
+- **Without Before UI**, ReShade's effects run on the output after the UI, once per shown frame (generated frames included). Their GPU cost grows with the frame-generation multiplier.
+
+### Before UI with UI Native
+
+- The effects run on the render-resolution frame right after ENB, before upscaling. The HUD is untouched, the upscaler anti-aliases the result, and generated frames interpolate the effects instead of re-running them. They also cost less, since they run at the render resolution.
+- Depth is this frame's depth at the same resolution, so depth-based effects line up exactly.
+- **Effects sized in pixels appear larger**, because they are drawn at the render resolution and then upscaled: overlays and layers (Layer), borders, ASCII, CRT lines, film grain. The factor depends on the Render Resolution preset:
+
+  | Preset | Render scale | Pixel-sized effects appear | Multiply their size by |
+  |---|---|---|---|
+  | Native | 100% | ×1.00 | 1.00 |
+  | Quality | 67% | ×1.50 | 0.67 |
+  | Balanced | 59% | ×1.70 | 0.59 |
+  | Performance | 50% | ×2.00 | 0.50 |
+
+  For example, with Balanced set Layer's `Layer_Scale` to 0.59 of its usual value. Readjust after changing the preset. The status panel and `f4sr.log` show the current factor. If you need pixel-exact overlays, turn Before UI off.
+- Changing the preset, or turning Before UI on or off, makes ReShade reload its effects at the new size (a short pause). Settings in the ReShade overlay apply live as usual.
+- Screen-fixed effects (vignette, grain, borders) pass through the upscaler. In testing they stayed clean; report any that smear.
+
+### Before UI with Classic
+
+- With FSR-FG or frame generation off, the effects run after upscaling and ENB, before the HUD. With frame generation on, screen-fixed effects can trail during motion.
+- With XeSS-FG on Classic, Before UI is not available; the effects stay on top of the HUD. Use UI Native.
+
+### Limits under XeSS-FG
+
+- ReShade's instance on the game's own swap chain never presents. Add-ons that act on the game's draws or choose when effects render (ReShade Effect Shader Toggler, REST) have no effect. **ReShade Depth** supplies depth instead of ReShade's own depth detection.
+- **Before UI** replaces add-ons such as ReShade Effect Shader Toggler for keeping effects off the HUD. Disable those.
+- Without Before UI, depth-based effects use the last real frame's depth on generated frames, so they can lag slightly behind fast motion.
 
 ## Known issues
 
 - Only Fallout 4 1.10.163 is supported.
-- Fine-edge shimmer at reduced render resolutions with ENB sharpening, as described under ENB notes.
+- Classic only: fine-edge shimmer at reduced render resolutions with ENB sharpening, as described under [Classic](#classic).
 - Menus other than terminals were checked less thoroughly at reduced render resolutions: power-armor HUD, workbench and VATS. If a translucent rectangle appears in the top-left corner of the screen, please report which menu showed it.
 - Frame generation adds input latency, as all frame generation does.
 
@@ -105,7 +163,9 @@ Pick the multiplier where *real FPS × multiplier* is close to your refresh rate
 
 - Fallout 4 1.10.163, F4SE 0.6.23, with ENB, on:
   - AMD Radeon RX 7900 XT, 3840×2160 at 165 Hz, VRR, Linux (Proton, gamescope); with and without ReShade.
-  - AMD Radeon RX 7600, Windows (user report).
+  - AMD Radeon RX 7600, Windows (user report, 1.0.0-rc builds).
+
+1.1.0-alpha.1 has been tested on Linux only. UI Native is the Path B code that rc.4 already shipped as an option, now the default, and ReShade before upscaling uses only ReShade's add-on API and the D3D11/D3D12 shared textures F4SR already relies on. It is expected to work on Windows, but this has not been confirmed. Windows reports are especially welcome.
 
 Reports from NVIDIA and Intel GPUs and other resolutions are especially welcome. XeSS-FG has not been tested on NVIDIA GPUs yet.
 
@@ -116,7 +176,7 @@ Reports from NVIDIA and Intel GPUs and other resolutions are especially welcome.
 - **Commands:**
   ```sh
   tools/build-f4sr.sh --staticdeps
-  tools/package.sh build-sf dist/f4sr-v1.0.0-rc.4.zip
+  tools/package.sh build-sf dist/f4sr-v1.1.0-alpha.1.zip
   ```
 
 ## Credits

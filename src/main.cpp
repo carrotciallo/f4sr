@@ -15,12 +15,14 @@
 #include "ffx_runtime.h"
 #include "hooks.h"
 #include "settings.h"
+#include "sr_status.h"
+#include "version.h"
 #include "shader_capture.h"
 #include "texture_probe.h"
 
 extern "C" __declspec(dllexport) constinit F4SE::PluginVersionData F4SEPlugin_VersionData = [] {
 	F4SE::PluginVersionData data{};
-	data.PluginVersion(REL::Version{ 1, 0, 0, 0 });
+	data.PluginVersion(REL::Version{ 1, 1, 0, 0 });
 	data.PluginName("f4sr");
 	data.AuthorName("Muse for Carrot");
 	data.UsesAddressLibrary(true);
@@ -32,7 +34,7 @@ extern "C" __declspec(dllexport) constinit F4SE::PluginVersionData F4SEPlugin_Ve
 // name ("F4SEPlugin_Version"); F4SE itself reads the one above.
 extern "C" __declspec(dllexport) constinit F4SE::PluginVersionData F4SEPlugin_Version = [] {
 	F4SE::PluginVersionData data{};
-	data.PluginVersion(REL::Version{ 1, 0, 0, 0 });
+	data.PluginVersion(REL::Version{ 1, 1, 0, 0 });
 	data.PluginName("f4sr");
 	data.AuthorName("Muse for Carrot");
 	data.UsesAddressLibrary(true);
@@ -83,6 +85,13 @@ namespace f4sr
 		return path;
 	}
 
+	void WriteMcmValue(const char* key, const char* value)
+	{
+		const std::string mcmIni = McmIniPath();
+		if (!WritePrivateProfileStringA("Main", key, value, mcmIni.c_str()))
+			F4SE::log::error("f4sr: could not write {}={} to {} ({})", key, value, mcmIni, GetLastError());
+	}
+
 	// Values the MCM page saved override the plugin ini. `startup` also reads
 	// the keys that only apply at launch (frame-generation engine, FSR
 	// jitter-cancellation flag). Clamps the ranged values.
@@ -105,12 +114,15 @@ namespace f4sr
 		mcmFloat("fSharpness", s.sharpness);
 		mcmBool("bEnableFrameGeneration", s.enableFrameGeneration);
 		if (startup) mcmInt("iFrameGenEngine", s.frameGenEngine);
+		if (startup) mcmInt("iPipeline", s.pipeline);
+		if (startup) mcmBool("bPipelineFellBack", s.pipelineFellBack);
 		mcmInt("iXeFGInterpolations", s.xefgInterpolations);
 		int mode = -1;  // MCM dropdown: 0 = 2X, 1 = 3X, 2 = 4X (supersedes iXeFGInterpolations)
 		mcmInt("iXeFGMode", mode);
 		if (mode >= 0) s.xefgInterpolations = mode + 1;
 		mcmBool("bReactiveMask", s.reactiveMask);
 		mcmBool("bReShadeBeforeUI", s.reshadeBeforeUi);
+		mcmBool("bReShadeDepth", s.reshadeDepth);
 		// bENBSubNative is plugin-ini only: Native in Render Resolution covers
 		// the opt-out, and an MCM value saved by RC1-RC3 (default off) must not
 		// keep holding ENB users at native.
@@ -119,6 +131,7 @@ namespace f4sr
 		mcmBool("bFrameGenOverlay", s.frameGenOverlay);
 		mcmBool("bFrameGenCapture", s.frameGenCapture);
 		if (startup) mcmBool("bMVJitterCancellation", s.mvJitterCancellation);
+		s.qualityMode = std::clamp(s.qualityMode, 0, 3);
 		s.frameGenEngine = std::clamp(s.frameGenEngine, 0, 1);
 		s.xefgInterpolations = std::clamp(s.xefgInterpolations, 1, 3);
 	}
@@ -161,6 +174,12 @@ namespace f4sr
 		s.frameGenCapture = GetPrivateProfileIntA("f4sr", "bFrameGenCapture", 0, ini.c_str()) != 0;
 		s.fgPresentPath = GetPrivateProfileIntA("f4sr", "iFGPresentPath", 0, ini.c_str());
 		s.enbSubNative = GetPrivateProfileIntA("f4sr", "bENBSubNative", 1, ini.c_str()) != 0;
+		// bENBBeforeUpscaling (RC packages shipped it as 0) is no longer read:
+		// the MCM Render Pipeline choice replaces it.
+		s.pipeline = GetPrivateProfileIntA("f4sr", "iPipeline", 1, ini.c_str());
+		s.pathBNonLinearColor = GetPrivateProfileIntA("f4sr", "bPathBNonLinearColor", 1, ini.c_str()) != 0;
+		s.outputWidth = static_cast<int>(GetPrivateProfileIntA("f4sr", "iOutputWidth", 0, ini.c_str()));
+		s.outputHeight = static_cast<int>(GetPrivateProfileIntA("f4sr", "iOutputHeight", 0, ini.c_str()));
 		s.debugView = GetPrivateProfileIntA("f4sr", "bDebugView", 0, ini.c_str()) != 0;
 		s.forceReset = GetPrivateProfileIntA("f4sr", "bForceReset", 0, ini.c_str()) != 0;
 		s.probeOnly = GetPrivateProfileIntA("f4sr", "bProbeOnly", 0, ini.c_str()) != 0;
@@ -178,6 +197,7 @@ namespace f4sr
 		s.uiRelayout = GetPrivateProfileIntA("f4sr", "bUiRelayout", 1, ini.c_str()) != 0;
 		s.reactiveMask = GetPrivateProfileIntA("f4sr", "bReactiveMask", 1, ini.c_str()) != 0;
 		s.reshadeBeforeUi = GetPrivateProfileIntA("f4sr", "bReShadeBeforeUI", 0, ini.c_str()) != 0;
+		s.reshadeDepth = GetPrivateProfileIntA("f4sr", "bReShadeDepth", 1, ini.c_str()) != 0;
 		{
 			char rb[32]{};
 			GetPrivateProfileStringA("f4sr", "fReactiveScale", "1.0", rb, sizeof(rb), ini.c_str());
@@ -191,6 +211,14 @@ namespace f4sr
 		// [Main] (the page's control ids are "<key>:Main"). When that
 		// file has a key, it wins over the plugin ini defaults above.
 		ApplyMcmSettings(s, true);
+		s.pipeline = std::clamp(s.pipeline, 0, 1);
+		s.enbBeforeUpscaling = s.pipeline == 1 && s.frameGenEngine == 1;
+		F4SE::log::info("f4sr: render pipeline {} (setting {}, engine {}){}", s.enbBeforeUpscaling ? "UI at native resolution (Path B)" : "Classic (Path A)",
+			s.pipeline, s.frameGenEngine == 1 ? "XeSS-FG" : "FSR-FG: Classic only", s.pipelineFellBack ? (s.pipeline == 0 ? ", UI Native failed in an earlier run" : ", UI Native chosen again after an earlier failure") : "");
+		if (s.pipelineFellBack) {
+			if (s.pipeline == 0) sr_status::Raise(sr_status::kAlertPipelinePrevious);
+			else WriteMcmValue("bPipelineFellBack", "0");  // the player chose UI native again: try it
+		}
 		F4SE::log::info("f4sr: FSR-FG present path {}", s.fgPresentPath);
 		F4SE::log::info("f4sr: diagnostics overlay={} fgCapture={} captures={} captureKey=0x{:02X} textureProbe={} postDepth={} dynResGuard={}",
 			s.frameGenOverlay, s.frameGenCapture, s.diagnostics, s.captureKey, s.textureProbe, s.postDepth, s.dynResGuard);
@@ -201,13 +229,14 @@ namespace f4sr
 			s.enableUpscaling, s.backend, s.qualityMode, s.sharpness, s.enableFrameGeneration, s.frameGenEngine, s.xefgInterpolations, s.enbSubNative, s.debugView, ENBPresent(), s.mvJitterCancellation);
 	}
 
-	void ReloadMcmSettings()
+	Settings ReadMcmSettings()
 	{
-		auto& s = GetSettings();
+		auto s = GetSettings();
 		ApplyMcmSettings(s, false);
 		F4SE::log::info("f4sr: diagnostics overlay={} fgCapture={}", s.frameGenOverlay, s.frameGenCapture);
-		F4SE::log::info("f4sr: MCM settings reloaded live: upscaling={} backend={} quality={} sharpness={} frameGen={} xefgInterpolations={} debugView={} forceReset={}",
+		F4SE::log::info("f4sr: MCM settings requested: upscaling={} backend={} quality={} sharpness={} frameGen={} xefgInterpolations={} debugView={} forceReset={}",
 			s.enableUpscaling, s.backend, s.qualityMode, s.sharpness, s.enableFrameGeneration, s.xefgInterpolations, s.debugView, s.forceReset);
+		return s;
 	}
 
 	std::uint64_t McmSettingsWriteTime()
@@ -233,6 +262,7 @@ extern "C" __declspec(dllexport) bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadIn
 {
 	F4SE::Init(a_f4se);
 	F4SE::AllocTrampoline(1024);
+	F4SE::log::info("f4sr {}{}", f4sr::version::kName, f4sr::version::kExperimental ? " (experimental build)" : "");
 	f4sr::LoadSettings();
 	f4sr::xefg::InstallSwapChainRedirect();
 	if (f4sr::GetSettings().diagnostics) f4sr::shader_capture::Install();

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(f4sr VERSION 0.1.0 LANGUAGES CXX)
+project(f4sr VERSION 1.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
@@ -10,7 +10,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 # parsing and diagnostic severities).
 add_subdirectory(third_party/CommonLibF4)
 
-add_library(f4sr SHARED src/main.cpp src/ffx_runtime.cpp src/upscaling.cpp src/interop.cpp src/frame_pipeline.cpp src/frame_pipeline_diag.cpp src/proxy_targets.cpp src/hooks.cpp src/framegen.cpp src/xess_upscaling.cpp src/texture_probe.cpp src/fg_overlay.cpp src/late_draw_trace.cpp src/xefg_presenter.cpp src/menu_effects.cpp src/dynres_audit.cpp src/reshade_preui.cpp)
+add_library(f4sr SHARED src/main.cpp src/ffx_runtime.cpp src/upscaling.cpp src/interop.cpp src/frame_pipeline.cpp src/frame_pipeline_diag.cpp src/proxy_targets.cpp src/hooks.cpp src/framegen.cpp src/xess_upscaling.cpp src/texture_probe.cpp src/fg_overlay.cpp src/late_draw_trace.cpp src/xefg_presenter.cpp src/menu_effects.cpp src/dynres_audit.cpp src/reshade_preui.cpp src/ui_redirect.cpp src/frame_pipeline_pathb.cpp src/scaleform_scale.cpp)
 target_link_libraries(f4sr PRIVATE d3d11 d3d12 dxgi d3dcompiler gdi32)
 target_include_directories(f4sr PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/sdk/FidelityFX-SDK/Kits/FidelityFX/api/include"

@@ -26,6 +26,15 @@ namespace f4sr
 		// pre-fix path). Re-read from f4sr.ini while running (PluginIniInt).
 		int fgPresentPath{ 0 };
 		bool enbSubNative{ true };
+		// Render pipeline (MCM iPipeline, startup-only): 1 = UI at native
+		// resolution (Path B: game and ENB at the render size, upscaled before
+		// the UI, XeSS-FG output chain at the display size), 0 = Classic (Path A).
+		// Path B needs the XeSS-FG engine; enbBeforeUpscaling is the result.
+		int pipeline{ 1 };
+		bool pipelineFellBack{ false };  // MCM bPipelineFellBack: Path B failed in an earlier run
+		bool enbBeforeUpscaling{ false };
+		bool pathBNonLinearColor{ true };  // startup-only; preset outputs gamma-encoded SDR
+		int outputWidth{ 0 }, outputHeight{ 0 };  // 0 = automatic
 		bool debugView{ false };
 		bool forceReset{ false };
 		bool mvJitterCancellation{ false };  // startup-only diagnostic control for the FSR context
@@ -52,6 +61,9 @@ namespace f4sr
 		bool reactiveMask{ true };
 		// ReShade effects rendered by f4sr before the UI (reshade_preui.h).
 		bool reshadeBeforeUi{ false };
+		// Under XeSS-FG, bind F4SR's render-size depth as ReShade's DEPTH on
+		// the output runtime (ReShade sees no game draws there). Live.
+		bool reshadeDepth{ true };
 		float reactiveScale{ 1.0f };
 		bool proxyTargets{ true };  // render-resolution proxy targets around the composite/SSLR passes
 		int colorSlot{ 4 };       // direct RendererData slots, pinned empirically;
@@ -61,11 +73,12 @@ namespace f4sr
 
 	Settings& GetSettings();
 	void LoadSettings();
-	// Live switching: re-apply the MCM settings pass (Data\MCM\
-	// Settings\f4sr.ini) onto the live Settings, and the MCM file's
-	// last-write time (0 when missing) for change detection.
-	void ReloadMcmSettings();
+	// Read live MCM overrides without publishing the new settings.
+	Settings ReadMcmSettings();
+	// The MCM file's last-write time (0 when missing).
 	std::uint64_t McmSettingsWriteTime();
+	// Writes one value into the MCM settings file ([Main]).
+	void WriteMcmValue(const char* key, const char* value);
 	// One integer from Data\F4SE\Plugins\f4sr.ini [f4sr], read now.
 	int PluginIniInt(const char* key, int fallback);
 	bool ENBPresent();
