@@ -16,6 +16,39 @@ F4SR 用现代时域超分替换游戏自带的 TAA，并可在此之上叠加�
 
 > 状态：**发布候选（release candidate）**。目前只在少数配置上测试过（见[测试环境](#测试环境)）。欢迎附带 `f4sr.log` 提交 bug 报告。
 
+## 两个版本：推荐实验版
+
+F4SR 有两个构建：
+
+- **实验版 — [v1.1.0-alpha.1](https://github.com/carrotciallo/f4sr/releases/tag/v1.1.0-alpha.1)**（预发布；源码在 [`experimental`](https://github.com/carrotciallo/f4sr/tree/experimental) 分支）。**推荐使用这个版本。** 它新增了 **UI Native** 管线：游戏、ENB 与 ReShade 全部在渲染分辨率下运行，完成的画面再被超分，UI 最后以完整输出分辨率绘制。在原生以下的档位，它比稳定版又快又干净——ENB 与 ReShade 随游戏一起变便宜，且 ENB 自带锐化在低渲染分辨率下可能出现的细边缘闪烁也消失了，因为 ENB 的效果会随画面一起被超分。UI Native 下还可以在游戏内实时切换渲染分辨率。
+- **稳定版 — v1.0.0-rc.4**（本分支）。只有 Classic 管线：超分在 ENB 后处理之前完成，ENB 仍在完整输出分辨率下运行。如果实验版与你的 ENB 版本或预设配合不佳，保留这个版本，并请附带 `f4sr.log` 反馈。
+
+| | 稳定版 v1.0.0-rc.4 | 实验版 v1.1.0-alpha.1 |
+|---|---|---|
+| 管线 | Classic | UI Native（默认）＋ Classic |
+| ENB 与 ReShade | 在输出分辨率运行，位于超分之后 | 在渲染分辨率运行，位于超分之前 |
+| 低分辨率下 ENB 边缘闪烁 | 可能出现 | 没有——ENB 效果随画面一起超分 |
+| 帧生成 | XeSS-FG（2X–4X，默认）或 FSR-FG（2X） | 引擎相同；XeSS-FG 走 UI Native，FSR-FG 始终走 Classic |
+
+### 性能
+
+在 RX 7900 XT 上实测：3840×2160 输出、FSR 4.1、ENB 0.501 加载预设并启用 ReShade、帧生成关闭（真实 FPS）：
+
+| 渲染分辨率 | UI Native（实验版） | Classic（稳定版） |
+|---|---|---|
+| 原生 — 3840×2160 | 45.3 | 48.8 |
+| 质量 — 2560×1440 | 68.6 | 57.8 |
+| 平衡 — 2258×1270 | 74.3 | 61.5 |
+| 性能 — 1920×1080 | 81.8 | 64.6 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/perf-4k-dark.svg">
+  <img src="docs/images/perf-4k-light.svg" alt="Real FPS at 3840x2160: Native 45.3 UI Native vs 48.8 Classic; Quality 68.6 vs 57.8; Balanced 74.3 vs 61.5; Performance 81.8 vs 64.6" width="760">
+</picture>
+
+原生档下 Classic 略快——100% 渲染比例时超分无从获益。在其余每个降档上实验版都领先，因为 ENB 与 ReShade 随游戏一起变便宜了。
+
+
 ## 环境要求
 
 | | |

@@ -16,6 +16,39 @@ F4SR replaces the game's TAA with a modern temporal upscaler and can add generat
 
 > Status: **release candidate**. It is tested on a few configurations only (see [Tested on](#tested-on)). Bug reports with `f4sr.log` attached are very welcome.
 
+## Two versions: the experimental build is recommended
+
+F4SR comes in two builds:
+
+- **Experimental — [v1.1.0-alpha.1](https://github.com/carrotciallo/f4sr/releases/tag/v1.1.0-alpha.1)** (pre-release; source on the [`experimental`](https://github.com/carrotciallo/f4sr/tree/experimental) branch). **This is the recommended build.** It adds the **UI Native** pipeline: the game, ENB and ReShade all render at the render resolution, the finished frame is upscaled, and the UI is drawn on top at full output resolution. Below Native that is both faster and cleaner than the stable build — ENB and ReShade get cheaper along with the game, and the fine-edge shimmer ENB's own sharpening can show at reduced resolutions is gone, because ENB's effects are upscaled with the frame. Render Resolution can also be switched live in-game under UI Native.
+- **Stable — v1.0.0-rc.4** (this branch). The Classic pipeline only: upscaling happens before ENB's post-processing, which still runs at full output resolution. Keep this build if the experimental one misbehaves with your ENB version or preset, and please report it with `f4sr.log` attached.
+
+| | Stable v1.0.0-rc.4 | Experimental v1.1.0-alpha.1 |
+|---|---|---|
+| Pipeline | Classic | UI Native (default) + Classic |
+| ENB and ReShade | Run at output resolution, after upscaling | Run at render resolution, before upscaling |
+| ENB edge shimmer at reduced resolutions | Can appear | Gone — ENB effects are upscaled with the frame |
+| Frame generation | XeSS-FG (2X–4X, default) or FSR-FG (2X) | Same engines; XeSS-FG runs on UI Native, FSR-FG always uses Classic |
+
+### Performance
+
+Measured on an RX 7900 XT at 3840×2160 output, FSR 4.1, ENB 0.501 with a preset and ReShade, frame generation off (real FPS):
+
+| Render resolution | UI Native (experimental) | Classic (stable) |
+|---|---|---|
+| Native — 3840×2160 | 45.3 | 48.8 |
+| Quality — 2560×1440 | 68.6 | 57.8 |
+| Balanced — 2258×1270 | 74.3 | 61.5 |
+| Performance — 1920×1080 | 81.8 | 64.6 |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/perf-4k-dark.svg">
+  <img src="docs/images/perf-4k-light.svg" alt="Real FPS at 3840x2160: Native 45.3 UI Native vs 48.8 Classic; Quality 68.6 vs 57.8; Balanced 74.3 vs 61.5; Performance 81.8 vs 64.6" width="760">
+</picture>
+
+At Native, Classic is slightly faster — at 100% render scale there is nothing to gain from upscaling. At every reduced resolution the experimental build is ahead, because ENB and ReShade get cheaper along with the game.
+
+
 ## Requirements
 
 | | |
