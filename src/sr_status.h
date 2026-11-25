@@ -93,6 +93,7 @@ namespace f4sr::sr_status
 	inline constexpr const char* kAlertPipeline = "ERR\t!UI native pipeline failed: restart (now Classic)\n";
 	inline constexpr const char* kAlertPipelineEarly = "ERR\t!UI native pipeline unavailable: using Classic\n";
 	inline constexpr const char* kAlertPipelinePrevious = "ERR\t!Classic pipeline: UI native failed last run\n";
+	inline constexpr const char* kAlertSmallIsize = "ERR\t!Fallout4Prefs.ini iSize far below the monitor\n";
 	inline constexpr const char* kAlertXefg = "ERR\t!XeSS-FG failed to start: no frame generation\n";
 
 	inline void SetBackend(std::string name)

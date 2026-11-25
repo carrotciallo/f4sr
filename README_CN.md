@@ -14,7 +14,7 @@ F4SR 用现代时域超分替换游戏自带的 TAA，并可在此之上叠加�
 - **反应遮罩（Reactive mask）。** 粒子、火焰、玻璃和水面不会被时域累积涂抹。
 - **游戏内设置** 通过 MCM 调整，多数选项即时生效。
 
-> 状态：**1.1.0-alpha.1，实验版。** 这一版把 UI Native 管线设为默认，并加入了 ReShade 超分前渲染。稳定版是 1.0.0-rc.4，需要经过验证的配置请继续使用它。本版只在 Linux 上测试过（见[测试环境](#测试环境)）。欢迎附带 `f4sr.log` 提交 bug 报告。
+> 状态：**1.1.0-alpha.2，实验版。** 这一版把 UI Native 管线设为默认，并加入了 ReShade 超分前渲染。稳定版是 1.0.0-rc.4，需要经过验证的配置请继续使用它。本版在 Linux 上开发，目前的 Windows 反馈来自 1.1.0-alpha.1（见[测试环境](#测试环境)）。欢迎附带 `f4sr.log` 提交 bug 报告。
 
 ## 环境要求
 
@@ -165,7 +165,7 @@ ENB 现在在超分之前、按渲染分辨率运行。大多数预设看起来�
   - AMD Radeon RX 7900 XT，3840×2160 @ 165 Hz，VRR，Linux（Proton、gamescope）；有无 ReShade 均测试过。
   - AMD Radeon RX 7600，Windows（用户报告，1.0.0-rc 版本）。
 
-1.1.0-alpha.1 只在 Linux 上测试过。UI Native 就是 rc.4 中已作为可选项提供的 Path B 代码，现在改为默认；ReShade 超分前渲染只用到 ReShade 的 add-on API，以及 F4SR 已在使用的 D3D11/D3D12 共享纹理。理论上应能在 Windows 上运行，但尚未确认，特别欢迎 Windows 用户反馈。
+1.1.0 的 alpha 版在 Linux 上开发。在 Windows 上，1.1.0-alpha.1 会让游戏窗口每次启动都变小（它把缩小后的分辨率存进了 `Fallout4Prefs.ini`），1.1.0-alpha.2 已修复。用过 alpha.1 的话，请把 `文档\My Games\Fallout4\Fallout4Prefs.ini` 里的 `iSize W` 和 `iSize H` 手动改回你的分辨率一次。特别欢迎 Windows 用户反馈，包括显示缩放（DPI）高于 100% 的情况。
 
 特别欢迎来自 NVIDIA 与 Intel GPU 以及其他分辨率的报告。XeSS-FG 尚未在 NVIDIA GPU 上测试过。
 
@@ -176,7 +176,7 @@ ENB 现在在超分之前、按渲染分辨率运行。大多数预设看起来�
 - **命令：**
   ```sh
   tools/build-f4sr.sh --staticdeps
-  tools/package.sh build-sf dist/f4sr-v1.1.0-alpha.1.zip
+  tools/package.sh build-sf dist/f4sr-v1.1.0-alpha.2.zip
   ```
 
 ## 致谢

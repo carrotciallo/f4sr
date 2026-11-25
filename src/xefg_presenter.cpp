@@ -7,6 +7,7 @@
 #include "output_scale.h"
 #include "swapchain_inner.h"
 #include "reshade_preui.h"
+#include "isize_reads.h"
 
 #include <Windows.h>
 #include <intrin.h>
@@ -551,27 +552,66 @@ namespace
 		return 0;
 	}
 
-	UINT RenderValue(int which, UINT display)
+	// The display size as found in the player's INI files (index 1 = width,
+	// 2 = height); this is what gets written back.
+	UINT g_fileDisplay[3]{};
+
+	const char* IniName(LPCSTR file)
 	{
-		if (display == 0 || g_pathBOff.load(std::memory_order_relaxed)) return display;
-		if (const auto size = g_latchedRenderSize.load(std::memory_order_acquire))
-			return which == 1 ? static_cast<UINT>(size >> 32) : static_cast<UINT>(size);
-		const float ratio = RenderRatio(GetSettings().qualityMode);
-		const UINT render = ratio >= 1.0f ? display : (static_cast<UINT>(std::lround(display * ratio)) & ~1u);
-		if (render != display) {
-			if (which == 1) { g_displayWidth = display; g_gameWidth = render; }
-			else { g_displayHeight = display; g_gameHeight = render; }
+		if (!file) return "(win.ini)";
+		const char* slash = std::strrchr(file, '\\');
+		const char* fwd = std::strrchr(file, '/');
+		const char* name = slash > fwd ? slash : fwd;
+		return name ? name + 1 : file;
+	}
+
+	void LogSizeRead(int which, LPCSTR file, const char* what, UINT read, UINT answer)
+	{
+		static std::atomic<int> logged{};
+		if (logged.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+		F4SE::log::info("f4sr: ENB before upscaling: {} from {}: {} {} -> {}", which == 1 ? "iSize W" : "iSize H", IniName(file), what, read, answer);
+	}
+
+	// A value the game read from `file`. Only values really in the file are
+	// display sizes; a missing key returns the game's own default (its
+	// current, already lowered value), which is handed back unchanged.
+	UINT RenderValue(int which, UINT value, LPCSTR section, LPCSTR key, LPCSTR file)
+	{
+		if (value == 0 || g_pathBOff.load(std::memory_order_relaxed)) return value;
+		unsigned monW{}, monH{};
+		isize_reads::MonitorMode(monW, monH);
+		const auto a = isize_reads::Decide(which, value, section, key, file, RenderRatio(GetSettings().qualityMode), monW, monH);
+		if (!a.present) {
+			LogSizeRead(which, file, "absent, default", value, value);
+			return value;
 		}
-		static int logged = 0;
-		if (logged++ < 4) F4SE::log::info("f4sr: ENB before upscaling: Fallout4Prefs {} = {} read as {}", which == 1 ? "iSize W" : "iSize H", display, render);
-		return render;
+		if (const auto size = g_latchedRenderSize.load(std::memory_order_acquire)) {
+			const UINT render = which == 1 ? static_cast<UINT>(size >> 32) : static_cast<UINT>(size);
+			LogSizeRead(which, file, "latched", value, render);
+			return render;
+		}
+		g_fileDisplay[which] = value;
+		if (a.implausible) {
+			static std::atomic<bool> reported{};
+			if (!reported.exchange(true)) {
+				F4SE::log::warn("f4sr: ENB before upscaling: {} sets iSize {}x{}, below half of the monitor ({}x{}); if that is not your choice, set iSize W/H in Fallout4Prefs.ini to your resolution",
+					IniName(file), a.fileW, a.fileH, monW, monH);
+				sr_status::Raise(sr_status::kAlertSmallIsize);
+			}
+		}
+		if (a.render != a.display) {
+			if (which == 1) { g_displayWidth = a.display; g_gameWidth = a.render; }
+			else { g_displayHeight = a.display; g_gameHeight = a.render; }
+		}
+		LogSizeRead(which, file, "display", value, a.render);
+		return a.render;
 	}
 
 	UINT WINAPI GetProfileIntHook(LPCSTR section, LPCSTR key, INT def, LPCSTR file)
 	{
 		const UINT v = g_origGetProfileInt(section, key, def, file);
 		const int which = SizeKey(key);
-		return which ? RenderValue(which, v) : v;
+		return which ? RenderValue(which, v, section, key, file) : v;
 	}
 
 	DWORD WINAPI GetProfileStringHook(LPCSTR section, LPCSTR key, LPCSTR def, LPSTR out, DWORD size, LPCSTR file)
@@ -580,20 +620,27 @@ namespace
 		const int which = SizeKey(key);
 		if (!which || !out || n == 0) return n;
 		char* end{};
-		const unsigned long display = std::strtoul(out, &end, 10);
-		if (end == out || display == 0) return n;
-		const auto text = std::to_string(RenderValue(which, static_cast<UINT>(display)));
+		const unsigned long value = std::strtoul(out, &end, 10);
+		if (end == out || value == 0) return n;
+		const auto text = std::to_string(RenderValue(which, static_cast<UINT>(value), section, key, file));
 		if (text.size() + 1 > size) return n;
 		std::memcpy(out, text.c_str(), text.size() + 1);
 		return static_cast<DWORD>(text.size());
 	}
 
+	// The game writes its in-memory iSize (the render size); the file keeps
+	// the display size it had.
 	BOOL WINAPI WriteProfileStringHook(LPCSTR section, LPCSTR key, LPCSTR value, LPCSTR file)
 	{
 		const int which = SizeKey(key);
-		const UINT display = which == 1 ? g_displayWidth : which == 2 ? g_displayHeight : 0;
-		if (which && display && value) {
+		UINT display = which ? g_fileDisplay[which] : 0;
+		if (which && !display) display = which == 1 ? g_displayWidth : g_displayHeight;
+		if (which && display) display = isize_reads::WriteValue(section, key, file, display);
+		if (which && display && value && !g_pathBOff.load(std::memory_order_relaxed)) {
 			const auto text = std::to_string(display);
+			static std::atomic<int> logged{};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+				F4SE::log::info("f4sr: ENB before upscaling: {} write to {}: {} kept as {}", which == 1 ? "iSize W" : "iSize H", IniName(file), value, text);
 			return g_origWriteProfileString(section, key, text.c_str(), file);
 		}
 		return g_origWriteProfileString(section, key, value, file);
@@ -1834,6 +1881,7 @@ namespace f4sr::xefg
 	bool RedirectInstalled() { return g_redirectInstalled; }
 
 	bool OutputScaling() { return g_presenter.attached && g_presenter.scaling; }
+	bool UiNativeSession() { return EnbBeforeUpscaling(); }
 	void* ReShadeDepth12(std::uint32_t& generation)
 	{
 		generation = g_presenter.reshadeDepthGeneration.load();

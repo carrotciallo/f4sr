@@ -435,7 +435,9 @@ bool FramePipeline::Init(ID3D11Device* device)
 	{
 		float want = QualityRatio(settings.qualityMode);
 		const char* note = nullptr;
-		if (ENBPresent() && want < 1.0f) {
+		// UI Native renders the game and ENB at the render size itself; the
+		// Classic ENB crops (and their fallback) do not apply.
+		if (ENBPresent() && want < 1.0f && !xefg::UiNativeSession()) {
 			if (!settings.enbSubNative) {
 				want = 1.0f;
 				note = "\t!ENB: held at Native\n\tbENBSubNative=0 in f4sr.ini\n";

@@ -14,7 +14,7 @@ F4SR replaces the game's TAA with a modern temporal upscaler and can add generat
 - **Reactive mask.** Particles, fire, glass and water are not smeared by temporal accumulation.
 - **In-game settings** through MCM. Most options apply live.
 
-> Status: **1.1.0-alpha.1, experimental build.** It makes the UI Native pipeline the default and adds ReShade before upscaling. The stable release is 1.0.0-rc.4; keep using it if you need a tested setup. This build was tested on Linux only (see [Tested on](#tested-on)). Bug reports with `f4sr.log` attached are very welcome.
+> Status: **1.1.0-alpha.2, experimental build.** It makes the UI Native pipeline the default and adds ReShade before upscaling. The stable release is 1.0.0-rc.4; keep using it if you need a tested setup. It was developed on Linux; Windows reports so far come from 1.1.0-alpha.1 (see [Tested on](#tested-on)). Bug reports with `f4sr.log` attached are very welcome.
 
 ## Requirements
 
@@ -165,7 +165,7 @@ ENB now runs before the upscaler, on the render-resolution frame. Most presets l
   - AMD Radeon RX 7900 XT, 3840×2160 at 165 Hz, VRR, Linux (Proton, gamescope); with and without ReShade.
   - AMD Radeon RX 7600, Windows (user report, 1.0.0-rc builds).
 
-1.1.0-alpha.1 has been tested on Linux only. UI Native is the Path B code that rc.4 already shipped as an option, now the default, and ReShade before upscaling uses only ReShade's add-on API and the D3D11/D3D12 shared textures F4SR already relies on. It is expected to work on Windows, but this has not been confirmed. Windows reports are especially welcome.
+The 1.1.0 alphas are developed on Linux. On Windows, 1.1.0-alpha.1 made the game window smaller on every launch (it saved a reduced resolution to `Fallout4Prefs.ini`); 1.1.0-alpha.2 fixes this. If you ran alpha.1, set `iSize W` and `iSize H` in `Documents\My Games\Fallout4\Fallout4Prefs.ini` back to your resolution once. Windows reports are especially welcome, including with display scaling (DPI) above 100%.
 
 Reports from NVIDIA and Intel GPUs and other resolutions are especially welcome. XeSS-FG has not been tested on NVIDIA GPUs yet.
 
@@ -176,7 +176,7 @@ Reports from NVIDIA and Intel GPUs and other resolutions are especially welcome.
 - **Commands:**
   ```sh
   tools/build-f4sr.sh --staticdeps
-  tools/package.sh build-sf dist/f4sr-v1.1.0-alpha.1.zip
+  tools/package.sh build-sf dist/f4sr-v1.1.0-alpha.2.zip
   ```
 
 ## Credits

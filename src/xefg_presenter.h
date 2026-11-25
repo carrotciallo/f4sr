@@ -47,6 +47,8 @@ namespace f4sr
 		// Path B is running: the game renders at its own size and frames are
 		// scaled to the proxy chain's (display) size.
 		[[nodiscard]] bool OutputScaling();
+		// This session runs the UI Native pipeline (Path B), attached or not yet.
+		[[nodiscard]] bool UiNativeSession();
 		// Render-size depth copy for ReShade (ID3D12Resource*, null until the
 		// first frame) and a counter that changes whenever it is recreated.
 		[[nodiscard]] void* ReShadeDepth12(std::uint32_t& generation);
