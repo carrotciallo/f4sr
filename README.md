@@ -20,10 +20,12 @@ F4SR replaces the game's TAA with a modern temporal upscaler and can add generat
 
 F4SR comes in two builds:
 
-- **Experimental — [v1.1.0-alpha.1](https://github.com/carrotciallo/f4sr/releases/tag/v1.1.0-alpha.1)** (pre-release; source on the [`experimental`](https://github.com/carrotciallo/f4sr/tree/experimental) branch). **This is the recommended build.** It adds the **UI Native** pipeline: the game, ENB and ReShade all render at the render resolution, the finished frame is upscaled, and the UI is drawn on top at full output resolution. Below Native that is both faster and cleaner than the stable build — ENB and ReShade get cheaper along with the game, and the fine-edge shimmer ENB's own sharpening can show at reduced resolutions is gone, because ENB's effects are upscaled with the frame. Render Resolution can also be switched live in-game under UI Native.
+- **Experimental — [v1.1.0-alpha.2](https://github.com/carrotciallo/f4sr/releases/tag/v1.1.0-alpha.2)** (pre-release; source on the [`experimental`](https://github.com/carrotciallo/f4sr/tree/experimental) branch). **This is the recommended build.** It adds the **UI Native** pipeline: the game, ENB and ReShade all render at the render resolution, the finished frame is upscaled, and the UI is drawn on top at full output resolution. Below Native that is both faster and cleaner than the stable build — ENB and ReShade get cheaper along with the game, and the fine-edge shimmer ENB's own sharpening can show at reduced resolutions is gone, because ENB's effects are upscaled with the frame. Render Resolution can also be switched live in-game under UI Native.
 - **Stable — v1.0.0-rc.4** (this branch). The Classic pipeline only: upscaling happens before ENB's post-processing, which still runs at full output resolution. Keep this build if the experimental one misbehaves with your ENB version or preset, and please report it with `f4sr.log` attached.
 
-| | Stable v1.0.0-rc.4 | Experimental v1.1.0-alpha.1 |
+**Note for alpha.1 users on Windows:** alpha.1 could save a smaller resolution into `Fallout4Prefs.ini` on every launch. If you ran alpha.1, set `iSize W` and `iSize H` in `Documents\My Games\Fallout4\Fallout4Prefs.ini` back to your monitor's resolution by hand, once — updating alone does not undo the saved value.
+
+| | Stable v1.0.0-rc.4 | Experimental v1.1.0-alpha.2 |
 |---|---|---|
 | Pipeline | Classic | UI Native (default) + Classic |
 | ENB and ReShade | Run at output resolution, after upscaling | Run at render resolution, before upscaling |

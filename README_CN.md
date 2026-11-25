@@ -20,10 +20,12 @@ F4SR 用现代时域超分替换游戏自带的 TAA，并可在此之上叠加�
 
 F4SR 有两个构建：
 
-- **实验版 — [v1.1.0-alpha.1](https://github.com/carrotciallo/f4sr/releases/tag/v1.1.0-alpha.1)**（预发布；源码在 [`experimental`](https://github.com/carrotciallo/f4sr/tree/experimental) 分支）。**推荐使用这个版本。** 它新增了 **UI Native** 管线：游戏、ENB 与 ReShade 全部在渲染分辨率下运行，完成的画面再被超分，UI 最后以完整输出分辨率绘制。在原生以下的档位，它比稳定版又快又干净——ENB 与 ReShade 随游戏一起变便宜，且 ENB 自带锐化在低渲染分辨率下可能出现的细边缘闪烁也消失了，因为 ENB 的效果会随画面一起被超分。UI Native 下还可以在游戏内实时切换渲染分辨率。
+- **实验版 — [v1.1.0-alpha.2](https://github.com/carrotciallo/f4sr/releases/tag/v1.1.0-alpha.2)**（预发布；源码在 [`experimental`](https://github.com/carrotciallo/f4sr/tree/experimental) 分支）。**推荐使用这个版本。** 它新增了 **UI Native** 管线：游戏、ENB 与 ReShade 全部在渲染分辨率下运行，完成的画面再被超分，UI 最后以完整输出分辨率绘制。在原生以下的档位，它比稳定版又快又干净——ENB 与 ReShade 随游戏一起变便宜，且 ENB 自带锐化在低渲染分辨率下可能出现的细边缘闪烁也消失了，因为 ENB 的效果会随画面一起被超分。UI Native 下还可以在游戏内实时切换渲染分辨率。
 - **稳定版 — v1.0.0-rc.4**（本分支）。只有 Classic 管线：超分在 ENB 后处理之前完成，ENB 仍在完整输出分辨率下运行。如果实验版与你的 ENB 版本或预设配合不佳，保留这个版本，并请附带 `f4sr.log` 反馈。
 
-| | 稳定版 v1.0.0-rc.4 | 实验版 v1.1.0-alpha.1 |
+**alpha.1 的 Windows 用户请注意：** alpha.1 可能在每次启动时把更小的分辨率存进 `Fallout4Prefs.ini`。用过 alpha.1 的话，请把 `文档\My Games\Fallout4\Fallout4Prefs.ini` 中的 `iSize W` 与 `iSize H` 手动改回自己显示器的分辨率，一次即可——只更新不会撤销已存下的值。
+
+| | 稳定版 v1.0.0-rc.4 | 实验版 v1.1.0-alpha.2 |
 |---|---|---|
 | 管线 | Classic | UI Native（默认）＋ Classic |
 | ENB 与 ReShade | 在输出分辨率运行，位于超分之后 | 在渲染分辨率运行，位于超分之前 |
