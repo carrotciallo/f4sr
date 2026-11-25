@@ -17,6 +17,20 @@
       }
     },
     {
+      "id": "iPipeline:Main",
+      "type": "dropdown",
+      "text": "Render Pipeline",
+      "help": "UI Native: the game and ENB render at the Render Resolution, the UI at full resolution. Faster, sharper UI. Needs the XeSS-FG engine (FSR-FG uses Classic). Needs a restart.",
+      "valueOptions": {
+        "sourceType": "ModSettingInt",
+        "options": [
+          "Classic",
+          "UI Native (recommended)"
+        ]
+      },
+      "groupCondition": 2
+    },
+    {
       "id": "iBackend:Main",
       "type": "dropdown",
       "text": "Upscaler",
@@ -34,7 +48,7 @@
       "id": "iQualityMode:Main",
       "type": "dropdown",
       "text": "Render Resolution",
-      "help": "Lower = more FPS, softer image. Native only replaces anti-aliasing. With ENB, use Native if the image looks wrong.",
+      "help": "Lower = more FPS, softer image. Native = AA only. Applies on return to gameplay; the panel says if a restart is needed.",
       "valueOptions": {
         "sourceType": "ModSettingInt",
         "options": [
@@ -74,7 +88,7 @@
       "id": "bEnableFrameGeneration:Main",
       "type": "switcher",
       "text": "Frame Generation",
-      "help": "Smoother motion, a little more latency. Needs upscaling. XeSS-FG: the first time needs a restart.",
+      "help": "Smoother motion, a little more latency. Needs upscaling. Classic + XeSS-FG: turning it on needs a restart.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -83,7 +97,7 @@
       "id": "iFrameGenEngine:Main",
       "type": "dropdown",
       "text": "Frame Generation Engine",
-      "help": "XeSS-FG: smoother pacing, lower latency, less ghosting, 2X-4X. FSR-FG: 2X fallback. Needs a restart.",
+      "help": "XeSS-FG: 2X-4X, smoother pacing, required for UI Native. FSR-FG: 2X, Classic pipeline only. Needs a restart.",
       "valueOptions": {
         "sourceType": "ModSettingInt",
         "options": [
@@ -116,7 +130,16 @@
       "id": "bReShadeBeforeUI:Main",
       "type": "switcher",
       "text": "ReShade Effects Before UI",
-      "help": "ReShade add-on build: effects go under the HUD. Not with XeSS-FG. Screen-fixed effects may trail with FG.",
+      "help": "Effects go under the HUD. UI Native: with ENB, before upscaling (exact depth). Screen-fixed overlays may smear.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "id": "bReShadeDepth:Main",
+      "type": "switcher",
+      "text": "ReShade Depth",
+      "help": "Gives ReShade the game's depth (AO, DOF, fog) under XeSS-FG and at reduced render sizes in Classic. Applies live.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -129,7 +152,16 @@
       "id": "bFrameGenOverlay:Main",
       "type": "switcher",
       "text": "Status Panel",
-      "help": "Top-left panel: upscaler, resolutions, GPU time, frame generation rate. Switches live.",
+      "help": "Top-left panel: FPS, upscaler, render size, frame generation, ReShade. Switches live. Errors show it for 30 s even when off.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
+      }
+    },
+    {
+      "id": "bLogSystemInfo:Main",
+      "type": "switcher",
+      "text": "Log System Info",
+      "help": "Writes GPU, driver, OS, display and related mods (ENB, ReShade, HighFPSPhysicsFix) at the top of f4sr.log for bug reports. No user or computer names. Applies at the next start.",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }

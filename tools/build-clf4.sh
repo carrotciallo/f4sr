@@ -6,13 +6,13 @@
 # that between the two configures.
 set -u
 source "$(dirname "$0")/env.sh"
-cd "$(dirname "$0")/.."
+cd "$HOME/muse/f4sr"
 ARGS=(-S third_party/CommonLibF4 -B build-clf4 -G Ninja
   -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja
   -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
   -DVCPKG_TARGET_TRIPLET=x64-windows-clang
-  -DVCPKG_OVERLAY_TRIPLETS="$F4SR_ROOT/tools/triplets"
-  -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$F4SR_ROOT/cmake/chainload-main.cmake"
+  -DVCPKG_OVERLAY_TRIPLETS=/home/carrot/muse/f4sr/tools/triplets
+  -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=/home/carrot/muse/f4sr/cmake/chainload-main.cmake
   -DVCPKG_MANIFEST_FEATURES=
   -DCMAKE_BUILD_TYPE=Release)
 rm -f build-clf4/CMakeCache.txt

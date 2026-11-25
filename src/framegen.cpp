@@ -1,4 +1,5 @@
 #include "sr_status.h"
+#include "version.h"
 #include "framegen.h"
 #include "frame_journal.h"
 #include "capture.h"
@@ -500,7 +501,6 @@ namespace f4sr
 				frame_journal::OnPresent(chain, reinterpret_cast<ID3D11DeviceContext*>(data->context));
 		}
 		if ((flags & DXGI_PRESENT_TEST) == 0) DumpPresentCaptures(chain);
-		if ((flags & DXGI_PRESENT_TEST) == 0) LogPresentViewport(chain);
 		if ((flags & DXGI_PRESENT_TEST) != 0) return PresentOn(chain, syncInterval, flags);
 		++overlaySample_.source;
 		overlaySample_.enabled = GetSettings().enableFrameGeneration;
@@ -708,30 +708,10 @@ namespace f4sr
 		}
 	}
 
-	void FrameGen::LogPresentViewport(IDXGISwapChain* chain)
-	{
-		static std::uint64_t s_presentCount = 0;
-		if ((++s_presentCount % 600) == 1) {
-			if (auto* data = RE::BSGraphics::RendererData::GetSingleton(); data != nullptr && data->context != nullptr) {
-				auto* vctx = reinterpret_cast<ID3D11DeviceContext*>(data->context);
-				UINT nvp = 8;
-				D3D11_VIEWPORT vps[8]{};
-				vctx->RSGetViewports(&nvp, vps);
-				DXGI_SWAP_CHAIN_DESC sd{};
-				chain->GetDesc(&sd);
-				F4SE::log::info("f4sr: vp present nvp={} vp0=({:.0f},{:.0f} {:.0f}x{:.0f}) bb={}x{}",
-					nvp,
-					nvp != 0 ? vps[0].TopLeftX : -1.0f, nvp != 0 ? vps[0].TopLeftY : -1.0f,
-					nvp != 0 ? vps[0].Width : -1.0f, nvp != 0 ? vps[0].Height : -1.0f,
-					sd.BufferDesc.Width, sd.BufferDesc.Height);
-			}
-		}
-	}
-
 	// Status panel on this chain (FSR-FG; XeSS-FG draws its own).
 	void FrameGen::DrawOverlay(IDXGISwapChain* chain, std::uint32_t flags, bool generated)
 	{
-		if (!GetSettings().frameGenOverlay || (flags & ~DXGI_PRESENT_ALLOW_TEARING) != 0) return;
+		if (!(GetSettings().frameGenOverlay || sr_status::PanelForced()) || (flags & ~DXGI_PRESENT_ALLOW_TEARING) != 0) return;
 		// While XeSS-FG is attached its presenter draws its own panel on this chain.
 		if (xefg::Attached()) return;
 		if (GetSettings().frameGenEngine != 0) {
@@ -740,14 +720,14 @@ namespace f4sr
 				static std::uint64_t srPrevious{};
 				std::string fg;
 				if (!GetSettings().enableFrameGeneration)
-					fg = "FG\tXeSS-FG  off\n";
+					fg = "FrameGen\toff (MCM)\n";
 				else if (!xefg::RedirectInstalled())
-					fg = "FG\t!XeSS-FG starts after a game restart\n"
+					fg = "FrameGen\t!XeSS-FG starts after a game restart\n"
 						 "\t(frame generation was off at launch)\n";
 				else
-					fg = "FG\t!none active: XeSS-FG selected but not attached\n"
-						 "\tlook for 'XeFG' errors in f4sr.log\n";
-				std::string text = "#F4SR\n" + sr_status::Lines(GetSettings().enableUpscaling, seconds, srPrevious) + "\n" + fg;
+					fg = "FrameGen\t!XeSS-FG selected but not running\n"
+						 "\t(see 'XeFG' lines in f4sr.log)\n";
+				const std::string text = sr_status::Panel("", fg, seconds, srPrevious);
 				return std::array<std::string, 2>{ text, text };
 			});
 			return;
@@ -763,19 +743,16 @@ namespace f4sr
 			const double source = rate(now.source, old.source);
 			const double gen = rate(now.generated, old.generated);
 			const double real = rate(now.real, old.real);
-			const char* stats = now.statistics == S_OK ? "VALID COUNTERS (NOT SCANOUT)" :
-				now.statistics == DXGI_ERROR_FRAME_STATISTICS_DISJOINT ? "DISJOINT / INVALID" : "UNAVAILABLE";
 			static std::uint64_t srPrevious{};
-			const std::string sr = sr_status::Lines(GetSettings().enableUpscaling, seconds, srPrevious);
+			std::string fg = std::string("FrameGen\tFSR-FG 2X") + (now.enabled ? "" : std::format("  paused: {}", now.reason)) +
+				(InnerRouting() ? "  (inner chain)" : g_innerChain ? "  (via wrapper)" : "") + "\n";
+			if (now.resets || now.failures) fg += std::format("\t!resets {}   failures {}\n", now.resets, now.failures);
+			const std::string fps = now.enabled ? std::format("{:.0f} real -> {:.0f} shown", source, real + gen) : std::format("{:.0f}", source);
 			std::array<std::string, 2> text;
 			for (int i = 0; i < 2; ++i) {
-				text[i] = "#F4SR" + std::string(i ? "   [G] generated frame" : "   [R] real frame") + "\n" + sr + "\n";
-				text[i] += std::string("FG\tFSR-FG 2X  ") + (now.enabled ? "generating" : "!paused") +
-					(InnerRouting() ? "  (inner chain)" : g_innerChain ? "  (via wrapper)" : "") + "\n";
-				if (!now.enabled) text[i] += std::format("\t!{}\n", now.reason);
-				text[i] += std::format("\t{:.0f} source fps -> {:.0f} submitted/s\n", source, real + gen);
-				if (now.resets || now.failures) text[i] += std::format("\t!resets {}   failures {}\n", now.resets, now.failures);
-				if (now.statistics != S_OK) text[i] += std::format("\t!DXGI frame statistics {}\n", stats);
+				std::uint64_t previous = srPrevious;
+				text[i] = sr_status::Panel(fps, fg, seconds, previous, i ? "   [G]" : "   [R]");
+				if (i) srPrevious = previous;
 			}
 			overlayPrevious_ = now;
 			return text;

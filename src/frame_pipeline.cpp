@@ -4,6 +4,7 @@
 #include "capture.h"
 #include "frame_camera.h"
 #include "late_draw_trace.h"
+#include "xefg_presenter.h"
 #include "post_depth_remap.h"
 #include "frame_journal.h"
 #include "temporal_witness.h"
@@ -210,9 +211,12 @@ bool FramePipeline::Init(ID3D11Device* device)
 		if (!CompileDepthShader(device)) {
 			return false;
 		}
+		const bool pathB = xefg::OutputScaling();
 		useXess_ = GetSettings().backend == 2;
 		if (useXess_) {
-			if (!xessUpscaler_.Create(interop_.Device12(), mainDesc.Width, mainDesc.Height, GetSettings().qualityMode, reactive_.Ready())) {
+			// Path B initializes XeSS at the actual pre-UI input/output pair.
+			// Path A still upscales the HDR target at the imagespace seam.
+			if (!pathB && !xessUpscaler_.Create(interop_.Device12(), mainDesc.Width, mainDesc.Height, GetSettings().qualityMode, reactive_.Ready())) {
 				return false;
 			}
 		} else if (!upscaler_.Create(interop_.Device12(), mainDesc.Width, mainDesc.Height,
@@ -255,6 +259,19 @@ bool FramePipeline::Init(ID3D11Device* device)
 		proxyDrive_ = false;
 		upscaler_.Destroy();
 		xessUpscaler_.Destroy();
+		upscalerB_.Destroy();
+		pathBDecode_ = {};
+		pathBEncode_ = {};
+		ldrShared_ = {};
+		sceneOut_ = {};
+		bStage_ = 0;
+		bSucceeded_ = false;
+		bFailStreak_ = 0;
+		pathBXessUnavailable_ = false;
+		pendingBReady_ = false;
+		pathBTaaBypassed_ = false;
+		pathBLastTaaBypassed_ = false;
+		pathBLastUpscaled_ = false;
 		colorShared_ = {};
 		depthShared_ = {};
 		mvShared_ = {};
@@ -289,6 +306,7 @@ bool FramePipeline::Init(ID3D11Device* device)
 		initAttempted_ = false;
 		if (Init(device)) {
 			ResetInitBackoff();
+			sr_status::Clear(sr_status::kAlertSrStart);
 			return true;
 		}
 		if (!initAttempted_) {
@@ -303,6 +321,7 @@ bool FramePipeline::Init(ID3D11Device* device)
 			interop_.Destroy();
 			F4SE::log::error("f4sr: pipeline init failed {} times; super resolution stays off until a setting changes",
 				initFailures_);
+			sr_status::Raise(sr_status::kAlertSrStart);
 			return false;
 		}
 		const std::uint64_t delayMs = (std::min)(60000ull, 2000ull << (initFailures_ - 1));
@@ -416,7 +435,9 @@ bool FramePipeline::Init(ID3D11Device* device)
 	{
 		float want = QualityRatio(settings.qualityMode);
 		const char* note = nullptr;
-		if (ENBPresent() && want < 1.0f) {
+		// UI Native renders the game and ENB at the render size itself; the
+		// Classic ENB crops (and their fallback) do not apply.
+		if (ENBPresent() && want < 1.0f && !xefg::UiNativeSession()) {
 			if (!settings.enbSubNative) {
 				want = 1.0f;
 				note = "\t!ENB: held at Native\n\tbENBSubNative=0 in f4sr.ini\n";
@@ -425,37 +446,21 @@ bool FramePipeline::Init(ID3D11Device* device)
 				note = "\t!ENB: held at Native\n\tsee f4sr.log\n";
 			}
 		}
-		if (sr_status::g.note.exchange(note) != note && note)
+		if (sr_status::g.note.exchange(note) != note && note) {
+			sr_status::Poke();
 			F4SE::log::info("f4sr: render resolution {} is held at native with ENB: {}", settings.qualityMode,
 				settings.enbSubNative ? late_trace::SubNativeReason() : "bENBSubNative=0 in f4sr.ini");
+		}
 		if (g_nativeForMenu) {
 			want = 1.0f;
 		}
+		// Path B: the game already renders at the render size; the upscaler
+		// does not shrink it further.
+		if (xefg::OutputScaling()) want = 1.0f;
 		return want;
 	}
 
 }
-
-
-	namespace
-	{
-		void LogViewport(ID3D11DeviceContext* ctx, const char* tag)
-		{
-			UINT nvp = 8;
-			D3D11_VIEWPORT vps[8]{};
-			ctx->RSGetViewports(&nvp, vps);
-			UINT nsc = 8;
-			D3D11_RECT scs[8]{};
-			ctx->RSGetScissorRects(&nsc, scs);
-			F4SE::log::info("f4sr: vp {} nvp={} vp0=({:.0f},{:.0f} {:.0f}x{:.0f}) nsc={} sc0=({},{},{}x{})",
-				tag, nvp,
-				nvp != 0 ? vps[0].TopLeftX : -1.0f, nvp != 0 ? vps[0].TopLeftY : -1.0f,
-				nvp != 0 ? vps[0].Width : -1.0f, nvp != 0 ? vps[0].Height : -1.0f,
-				nsc,
-				nsc != 0 ? scs[0].left : -1, nsc != 0 ? scs[0].top : -1,
-				nsc != 0 ? scs[0].right - scs[0].left : -1, nsc != 0 ? scs[0].bottom - scs[0].top : -1);
-		}
-	}
 
 	bool FramePipeline::SrResolved() const
 	{
@@ -538,8 +543,21 @@ bool FramePipeline::Init(ID3D11Device* device)
 				const auto dispH = static_cast<float>(state->screenHeight);
 				const std::uint32_t rendW = (std::max)(1u, static_cast<std::uint32_t>(dispW * ratio));
 				const std::uint32_t rendH = (std::max)(1u, static_cast<std::uint32_t>(dispH * ratio));
+				// The projection still uses game render pixels. Only the phase
+				// count depends on the final output, which is a separate chain in Path B.
+				const UINT pathBOutputW = xefg::OutputScaling() ? xefg::OutputWidth() : 0;
+				const float upscaleW = pathBOutputW ? static_cast<float>(pathBOutputW) : dispW;
 				const std::int32_t phaseCount = (std::max)(1, static_cast<std::int32_t>(
-					8.0f * std::pow(dispW / static_cast<float>(rendW), 2.0f)));
+					8.0f * std::pow(upscaleW / static_cast<float>(rendW), 2.0f)));
+				if (pathBOutputW) {
+					static std::uint32_t lastRenderW{};
+					static UINT lastOutputW{};
+					if (lastRenderW != rendW || lastOutputW != pathBOutputW) {
+						lastRenderW = rendW;
+						lastOutputW = pathBOutputW;
+						F4SE::log::info("f4sr: Path B jitter: render width {}, output width {}, {} phases", rendW, pathBOutputW, phaseCount);
+					}
+				}
 				const std::int32_t seq = static_cast<std::int32_t>(state->frameCount % static_cast<std::uint32_t>(phaseCount)) + 1;
 				haltonJitterX_ = Halton(seq, 2) - 0.5f;
 				haltonJitterY_ = Halton(seq, 3) - 0.5f;
@@ -580,20 +598,13 @@ bool FramePipeline::Init(ID3D11Device* device)
 			return;
 		}
 		const auto t = McmSettingsWriteTime();
-		if (t == 0) {
-			return;
-		}
-		if (mcmWriteTime_ == 0) {
-			mcmWriteTime_ = t;
-			return;
-		}
-		if (t == mcmWriteTime_) {
-			return;
-		}
+		if (!t || t == mcmWriteTime_) return;
 		const auto previous = GetSettings();
 		mcmWriteTime_ = t;
-		ReloadMcmSettings();
-		const auto& s = GetSettings();
+		auto s = ReadMcmSettings();
+		const int requestedQuality = s.qualityMode;
+		if (xefg::OutputScaling()) s.qualityMode = previous.qualityMode;
+		GetSettings() = s;
 		// A changed context setting deserves a fresh set of init attempts.
 		if (s.backend != previous.backend || s.qualityMode != previous.qualityMode ||
 			s.debugView != previous.debugView || s.enableFrameGeneration != previous.enableFrameGeneration ||
@@ -616,6 +627,7 @@ bool FramePipeline::Init(ID3D11Device* device)
 				if (data && data->device) TryInit(reinterpret_cast<ID3D11Device*>(data->device));
 			}
 		}
+		if (xefg::OutputScaling()) xefg::RequestPathBQuality(requestedQuality);
 	}
 
 	namespace
@@ -660,7 +672,14 @@ bool FramePipeline::Init(ID3D11Device* device)
 
 	void FramePipeline::OnPreImagespace(void* rtManager)
 	{
+		if (static bool checked = false; !checked) {
+			// bTestAlert=1 in f4sr.ini: one fake alert on the first scene frame,
+			// to check that the error panel appears with the status panel off.
+			checked = true;
+			if (PluginIniInt("bTestAlert", 0) != 0) sr_status::Raise("Error\t!test alert (bTestAlert=1 in f4sr.ini)\n");
+		}
 		resolvedThisFrame_ = false;
+		pendingBReady_ = false;
 		frameGen_.Invalidate();
 		auto* data = RE::BSGraphics::RendererData::GetSingleton();
 		if (data == nullptr || data->device == nullptr) {
@@ -686,7 +705,10 @@ bool FramePipeline::Init(ID3D11Device* device)
 			ProbeFrame(data, ctx);
 			return;
 		}
-		SelectSlots(data, settings);
+		if (xefg::OutputScaling() && pathBSrBlocked_) return;
+		if (xefg::OutputScaling() && usePathBLogicalSlots_) {
+			if (!SelectPathBSceneSlots(*data)) return;
+		} else SelectSlots(data, settings);
 		if (!FrameFlowSettled()) return;
 		if (!initialized_) {
 			TryInit(device);
@@ -696,7 +718,7 @@ bool FramePipeline::Init(ID3D11Device* device)
 		auto& mainTarget = data->renderTargets[slotMain_];
 		auto& mvTarget = data->renderTargets[slotMV_];
 		auto& depthTarget = data->depthStencilTargets[slotDepth_];
-		if (mainTarget.texture == nullptr || mvTarget.texture == nullptr || depthTarget.texture == nullptr) {
+		if (!mainTarget.texture || !mvTarget.texture || !depthTarget.texture || !depthTarget.srViewDepth) {
 			return;
 		}
 
@@ -742,6 +764,15 @@ bool FramePipeline::Init(ID3D11Device* device)
 		ID3D12Resource* reactiveMask = CaptureInputs(ctx, settings, mainTex,
 			reinterpret_cast<ID3D11Texture2D*>(mvTarget.texture), reinterpret_cast<ID3D11ShaderResourceView*>(depthTarget.srViewDepth));
 
+		if (xefg::OutputScaling()) {
+			// Path B: the inputs wait for the finished frame at the
+			// pre-interface point; imagespace and ENB run on the raw scene.
+			BuildUpscaleFrame(settings, displayW, displayH, reactiveMask, pendingB_);
+			pendingBFrame_ = CaptureFrameId();
+			pendingBReady_ = true;
+			HandOffToImagespace(ctx, data, rtManager, mainTex, displayW, displayH);
+			return;
+		}
 		UpscaleFrame frame{};
 		if (!DispatchUpscale(ctx, settings, displayW, displayH, mainTex, reactiveMask, frame)) return;
 
@@ -782,6 +813,18 @@ bool FramePipeline::Init(ID3D11Device* device)
 					reinterpret_cast<const void*>(data->renderTargets[4].texture));
 			}
 		}
+	}
+
+	bool FramePipeline::SelectPathBSceneSlots(const RE::BSGraphics::RendererData& data)
+	{
+		UINT width{}, height{}, outW{}, outH{};
+		if (!xefg::PathBSizes(width, height, outW, outH)) return false;
+		const auto slots = logical::ReadSceneSlots();
+		if (!logical::SceneTargetsMatch(data, slots, width, height)) return false;
+		slotMain_ = slots.color;
+		slotDepth_ = slots.depth;
+		slotMV_ = slots.motion;
+		return true;
 	}
 
 	// False while frame flow has not settled since the last load (init is deferred).
@@ -876,9 +919,6 @@ bool FramePipeline::Init(ID3D11Device* device)
 	ID3D12Resource* FramePipeline::CaptureInputs(ID3D11DeviceContext* ctx, const Settings& settings, ID3D11Texture2D* mainTex,
 		ID3D11Texture2D* mvTex, ID3D11ShaderResourceView* depthSrv)
 	{
-		if (resolveCount_ % 600 == 0) {
-			LogViewport(ctx, "seam-in");
-		}
 		ctx->OMSetRenderTargets(0, nullptr, nullptr);
 		// The upscaler, frame generation and the depth bridge read only the
 		// top-left render rectangle of these display-size inputs, so only
@@ -888,7 +928,8 @@ bool FramePipeline::Init(ID3D11Device* device)
 		ctx->CopySubresourceRegion(mvShared_.tex11.Get(), 0, 0, 0, 0, mvTex, 0, &renderBox);
 		ID3D12Resource* reactiveMask = settings.reactiveMask ?
 			reactive_.Generate(ctx, colorSrv_.Get(), renderW_, renderH_, settings.reactiveScale) : nullptr;
-		if (resolveCount_ % 600 == 0 && settings.reactiveMask)
+		static std::uint32_t captures = 0;  // Path B never advances resolveCount_
+		if (captures++ % 600 == 0 && settings.reactiveMask)
 			F4SE::log::info("f4sr: reactive mask {} (generated {}, no opaque snapshot {}, snapshots {})",
 				reactive_.Ready() ? "on" : "unavailable", reactive_.Generated(), reactive_.Missed(), reactive_.Snapshots());
 		sr_status::g.reactive.store(reactiveMask != nullptr, std::memory_order_relaxed);
@@ -1184,14 +1225,7 @@ bool FramePipeline::Init(ID3D11Device* device)
 	{
 		if (g_dumpStage.load() == 1) late_trace::End();
 		refraction_.End();
-		// The triangle swap is restored at the next frame's
-		// OnTemporalData, not here (see there). Viewport state is
-		// only logged (diagnostics).
-		if (resolveCount_ % 600 == 1) {
-			if (auto* data = RE::BSGraphics::RendererData::GetSingleton(); data != nullptr && data->context != nullptr) {
-				LogViewport(reinterpret_cast<ID3D11DeviceContext*>(data->context), "post-chain");
-			}
-		}
+		// The triangle swap is restored in the next OnTemporalData, not here.
 		if (g_dumpStage.load() == 1) {
 			if (CaptureFrameId() != firstDumpFrame_ || !DumpPointB()) F4SE::log::warn("f4sr: B missing for frame={}", firstDumpFrame_);
 			g_dumpStage.store(2); // B is not a prerequisite for the adjacent IN2/A2 pair.

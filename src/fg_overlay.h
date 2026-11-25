@@ -29,6 +29,7 @@ namespace f4sr
 	public:
 		using Builder = std::function<std::array<std::string, 2>(double seconds)>;
 		void Draw(IDXGISwapChain* chain, int variant, const Builder& build);
+		void DrawTo(ID3D11Texture2D* target, int variant, const Builder& build);
 		void Reset();
 	private:
 		bool Update(ID3D11Device* device, DXGI_FORMAT format, const std::array<std::string, 2>& text);

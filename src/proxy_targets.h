@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <initializer_list>
 
+namespace RE::BSGraphics { class RendererData; }
+
 namespace f4sr
 {
 	// Logical render-target ids (Dear-Modding engine layout, OG
@@ -40,6 +42,9 @@ namespace f4sr
 		inline constexpr std::int32_t kSAOCameraZ = 40;
 		inline constexpr std::int32_t kCount = 100;
 		inline constexpr std::int32_t kDepthMain = 1;  // DepthStencilTargetID
+		struct SceneSlots { std::uint32_t color, depth, motion; };
+		SceneSlots ReadSceneSlots();
+		bool SceneTargetsMatch(const RE::BSGraphics::RendererData& data, SceneSlots slots, UINT width, UINT height);
 	}
 
 	// BSGraphics::RenderTarget layout (0x30, six view/texture

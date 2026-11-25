@@ -11,6 +11,7 @@
 #include "depth_bridge.h"
 #include "framegen.h"
 #include "xefg_presenter.h"
+#include "output_scale.h"
 #include "interop.h"
 #include "proxy_targets.h"
 #include "refraction_bridge.h"
@@ -34,7 +35,12 @@ namespace f4sr
 	public:
 		// UpdateTemporalData thunk (after the original): capture the
 		// frame's jitter source values and dynamic-resolution ratios.
-		void BeginTemporalData() { resolvedThisFrame_ = false; }
+		void BeginTemporalData()
+		{
+			resolvedThisFrame_ = false;
+			pendingBReady_ = false;
+			pathBTaaBypassed_ = false;
+		}
 		void OnTemporalData(RE::BSGraphics::State* state);
 		// RenderEffectRange thunk (before the original): run SR and
 		// replace kMain. rtManager is the thunk's `this` (ratios live at
@@ -43,6 +49,12 @@ namespace f4sr
 		void OnPostImagespace(void* rtManager);
 		void OnPreInterface(void* rtManager)
 		{
+			// Path B: upscale the finished frame into the display-size canvas
+			// the UI then draws on.
+			if (ComposePathB(rtManager)) {
+				reshade_preui::AfterPathB(pathBReShadeFx_);
+				return;
+			}
 			// Effects first, so the HUD-less captures carry them.
 			reshade_preui::Render(rtManager);
 			frameGen_.CaptureHudless(rtManager);
@@ -54,6 +66,8 @@ namespace f4sr
 		void LogDiagStats(ID3D11DeviceContext* ctx);
 		[[nodiscard]] bool SrActive() const { return initialized_ && settingsEnabled_ && interop_.Healthy(); }
 		[[nodiscard]] bool SrResolved() const;
+		// Path B has captured inputs but has not dispatched yet at native TAA.
+		bool TryBypassPathBTaa();
 		// Composite/SSLR hook gating: the pipeline is driving a
 		// sub-native frame and the proxy module is enabled.
 		[[nodiscard]] bool ProxyDriving() const { return proxyDrive_; }
@@ -71,6 +85,47 @@ namespace f4sr
 		void OnOpaqueComposited();
 
 	private:
+		// Path B (frame_pipeline_pathb.cpp).
+		bool ComposePathB(void* rtManager);
+	public:
+		// Path B, after each Present: a frame without a pre-interface point
+		// (main menu, loading) draws its UI on the canvas from the start.
+		void AfterPresentPathB();
+		bool PreparePathBResize();
+		void RebindPathBSceneSlots() { usePathBLogicalSlots_ = true; }
+		void BlockPathBSr() { pathBSrBlocked_ = true; }
+	private:
+		bool usePathBLogicalSlots_{};
+		bool pathBSrBlocked_{};
+		bool SelectPathBSceneSlots(const RE::BSGraphics::RendererData& data);
+		bool CreateUpscalerB(UINT w, UINT h, UINT outW, UINT outH, DXGI_FORMAT typed);
+		Microsoft::WRL::ComPtr<ID3D11RenderTargetView> canvasRtv_;
+		bool composedThisFrame_{ false };
+		int bStage_{ 0 };
+		std::uint32_t bFailStreak_{ 0 };
+		bool bSucceeded_{ false };
+		bool pathBXessUnavailable_{};
+		bool EnsurePathB(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& frameBuffer, UINT outW, UINT outH);
+		FfxUpscaler upscalerB_;
+		SharedTexture ldrShared_;   // render-size post-ENB color, linearized for XeSS when needed
+		// ReShade before upscaling (bReShadeBeforeUI on UI Native): the
+		// post-ENB frame and this frame's depth, both render size, for the
+		// effects pass on the output runtime; the result is copied back.
+		SharedTexture fxColor_, fxDepth_;
+		bool fxDepthValid_{};
+		bool pathBReShadeFx_{};
+		bool ApplyReShadePreUpscale(ID3D11DeviceContext* ctx, ID3D11Texture2D* fbTex, const D3D11_TEXTURE2D_DESC& fb);
+		SharedTexture sceneOut_;    // display size, upscaler output
+		Microsoft::WRL::ComPtr<ID3D11Texture2D> canvas_;  // display size; the UI draws here
+		output_scale::Scaler scaleB_, pathBDecode_, pathBEncode_;
+		UpscaleFrame pendingB_{};
+		std::uint32_t pendingBFrame_{};
+		bool pendingBReady_{ false };
+		bool PathBInputsReady() const;
+		bool pathBTaaBypassed_{};
+		bool pathBLastTaaBypassed_{};
+		bool pathBLastUpscaled_{};
+		bool pathBFailed_{ false };
 		// OnPreImagespace stages, in order.
 		void SelectSlots(RE::BSGraphics::RendererData* data, const Settings& settings);
 		bool FrameFlowSettled();

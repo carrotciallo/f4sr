@@ -20,14 +20,16 @@ namespace f4sr
 	{
 	public:
 		bool Create(ID3D12Device* device, std::uint32_t outputWidth, std::uint32_t outputHeight, int qualityMode, bool responsiveMask = false);
+		bool CreatePathB(ID3D12Device* device, xess_2d_t input, xess_2d_t output, int qualityMode);
 		void Destroy();
 		bool Dispatch(ID3D12GraphicsCommandList* cmdList, const UpscaleFrame& frame);
 		[[nodiscard]] bool Created() const { return context_ != nullptr; }
 
+		[[nodiscard]] bool WantsMask() const { return responsiveMask_; }
+
 	private:
+		bool CreateImpl(ID3D12Device* device, xess_2d_t output, int qualityMode, bool responsiveMask, const xess_2d_t* pathBInput);
 		xess_context_handle_t context_{ nullptr };
 		bool responsiveMask_{ false };
-	public:
-		[[nodiscard]] bool WantsMask() const { return responsiveMask_; }
 	};
 }

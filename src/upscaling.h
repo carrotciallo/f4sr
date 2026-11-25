@@ -43,7 +43,8 @@ namespace f4sr
 		// backend: 0 = FSR 3.1, 1 = FSR 4.1 (see settings). debugView allows
 		// the FFX debug visualization output used by the acceptance checks.
 		bool Create(ID3D12Device* device, std::uint32_t maxRenderWidth, std::uint32_t maxRenderHeight,
-			std::uint32_t maxOutputWidth, std::uint32_t maxOutputHeight, int backend, bool debugView);
+			std::uint32_t maxOutputWidth, std::uint32_t maxOutputHeight, int backend, bool debugView,
+			bool hdr = true, bool nonLinearColor = false);
 		void Destroy();
 		bool Dispatch(ID3D12GraphicsCommandList* cmdList, const UpscaleFrame& frame, float sharpness, bool debugView);
 		[[nodiscard]] bool Created() const { return context_ != nullptr; }

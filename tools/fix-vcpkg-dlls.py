@@ -1,8 +1,5 @@
 import os, re, shutil, glob, sys
-root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "build", "vcpkg_installed", "x64-windows-clang",
-)
+root = os.path.expanduser("~/muse/f4sr/build/vcpkg_installed/x64-windows-clang")
 for tf in glob.glob(root + "/share/*/*[Tt]argets*.cmake"):
     txt = open(tf, errors="ignore").read()
     for rel in set(re.findall(r"\$\{_IMPORT_PREFIX\}/(tools/[^\"\) ]+\.dll)", txt)):

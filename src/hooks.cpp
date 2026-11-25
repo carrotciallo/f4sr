@@ -53,6 +53,8 @@ namespace
 		f4sr::gpu_timing::MarkAt(GameContext(), f4sr::gpu_timing::kPreInterface);
 		g_origPreInterface(manager, enabled);
 		f4sr::Pipeline().OnPreInterface(manager);
+		f4sr::gpu_timing::g.pathB = f4sr::xefg::OutputScaling();
+		f4sr::gpu_timing::MarkAt(GameContext(), f4sr::gpu_timing::kPostCompose);
 	}
 	TaaIsActive_t g_origTaaIsActive{ nullptr };
 
@@ -90,11 +92,11 @@ namespace
 		pipe.OnPreImagespace(rtManager);
 		f4sr::dynres_audit::OnSeam();
 		f4sr::gpu_timing::MarkAt(GameContext(), f4sr::gpu_timing::kPostSr);
-		// Suppress the game's own TAA resolve for this range: FSR already
-		// resolved the frame into kMain (State::taaState @ 0xA8).
+		// Path A already resolved kMain; Path B can bypass TAA once the
+		// later pre-UI resolve is ready to use this frame's captured inputs.
 		RE::BSGraphics::State* state = GameState();
 		RE::BSGraphics::TAA_STATE saved{};
-		const bool suppress = pipe.SrResolved() && state != nullptr && f4sr::GetSettings().suppressTaa;
+		const bool suppress = state && f4sr::GetSettings().suppressTaa && (pipe.SrResolved() || pipe.TryBypassPathBTaa());
 		if (suppress) {
 			saved = state->taaState.get();
 			state->taaState = RE::BSGraphics::TAA_STATE::kDisabled;
@@ -128,9 +130,8 @@ namespace
 		// same vfunc while driving an upscaler; the taaState field
 		// suppression in EffectRangeThunk does not stop the effect
 		// itself (2026-11-16 ENB/dynamic-resolution analysis).
-		if (f4sr::Pipeline().SrResolved() && f4sr::GetSettings().suppressTaa) {
-			return false;
-		}
+		auto& pipe = f4sr::Pipeline();
+		if (f4sr::GetSettings().suppressTaa && (pipe.SrResolved() || pipe.TryBypassPathBTaa())) return false;
 		return g_origTaaIsActive(effect);
 	}
 

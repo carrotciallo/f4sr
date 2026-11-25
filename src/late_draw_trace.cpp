@@ -5,6 +5,8 @@
 #include <intrin.h>
 #include <psapi.h>
 #include <filesystem>
+#include <format>
+#include <string>
 #include <wrl/client.h>
 #include <algorithm>
 #include <array>
@@ -449,6 +451,23 @@ namespace f4sr::late_trace
 			const auto enb=LocateEnbSites();
 			if(!enb.producerReturn || !v || inner.Get()==outer || !bt::SystemD3D11(v) || !bt::SystemD3D11(v[12]) || !bt::SystemD3D11(v[13])) {
 				bt::disabled=true; F4SE::log::warn("f4sr: early scene t5 wrapper/backend mismatch; leaving original pass intact");
+				// Which check failed, and where each pointer lives, so a report
+				// names the module standing between ENB and d3d11.
+				auto where=[](const void* at)->std::string {
+					if(!at) return "null";
+					const auto file=bt::ModuleFile(at);
+					std::string name="no module (allocated memory)";
+					if(!file.empty()) {
+						const int n=WideCharToMultiByte(CP_UTF8,0,file.c_str(),static_cast<int>(file.size()),nullptr,0,nullptr,nullptr);
+						name.assign(n>0?n:0,'\0');
+						if(n>0) WideCharToMultiByte(CP_UTF8,0,file.c_str(),static_cast<int>(file.size()),name.data(),n,nullptr,nullptr);
+					}
+					return std::format("{:p} in {}{}",at,name,bt::SystemD3D11(at)?"":" [rejected]");
+				};
+				if(!enb.producerReturn) F4SE::log::warn("f4sr: early scene check: ENB call sites not found");
+				else if(!v) F4SE::log::warn("f4sr: early scene check: ENB's context does not expose ID3D11DeviceContext1");
+				else if(inner.Get()==outer) F4SE::log::warn("f4sr: early scene check: ENB's context returns itself (no inner context); outer vtable {}",where(*reinterpret_cast<void**>(outer)));
+				else F4SE::log::warn("f4sr: early scene check: inner vtable {}; DrawIndexed {}; Draw {}; outer vtable {}",where(v),where(v[12]),where(v[13]),where(*reinterpret_cast<void**>(outer)));
 				SubNativeUnavailable(enb.producerReturn ? "ENB's draws do not reach a supported D3D11 backend" : "ENB's early-scene draw calls were not found in this ENB version");
 			} else {
 				bt::producerReturn=enb.producerReturn; bt::consumerReturn=enb.consumerReturn;

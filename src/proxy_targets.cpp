@@ -102,6 +102,28 @@ namespace f4sr
 	static_assert(sizeof(RE::BSGraphics::RenderTarget) == sizeof(RtStruct),
 		"CLF4 RenderTarget layout must match the RtStruct mirror");
 
+	logical::SceneSlots logical::ReadSceneSlots()
+	{
+		const auto* mgr = Manager();
+		const auto* rt = reinterpret_cast<const std::uint32_t*>(mgr + kRtIdOffset);
+		const auto* ds = reinterpret_cast<const std::uint32_t*>(mgr + kDsIdOffset);
+		return { rt[kMain], ds[kDepthMain], rt[kGBufferMotionVectors] };
+	}
+
+	bool logical::SceneTargetsMatch(const RE::BSGraphics::RendererData& data, SceneSlots slots, UINT width, UINT height)
+	{
+		if (!width || !height || slots.color >= std::size(data.renderTargets) || slots.depth >= std::size(data.depthStencilTargets) ||
+			slots.motion >= std::size(data.renderTargets) || slots.color == slots.motion) return false;
+		const auto matches = [=](auto* texture) {
+			if (!texture) return false;
+			D3D11_TEXTURE2D_DESC desc{};
+			reinterpret_cast<ID3D11Texture2D*>(texture)->GetDesc(&desc);
+			return desc.Width == width && desc.Height == height && desc.SampleDesc.Count == 1;
+		};
+		return data.depthStencilTargets[slots.depth].srViewDepth && matches(data.depthStencilTargets[slots.depth].texture) &&
+			matches(data.renderTargets[slots.color].texture) && matches(data.renderTargets[slots.motion].texture);
+	}
+
 	RtStruct* ProxyTargets::ResolveTarget(std::int32_t logical)
 	{
 		if (logical < 0 || logical >= logical::kCount) {

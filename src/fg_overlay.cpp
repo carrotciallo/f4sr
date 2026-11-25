@@ -13,7 +13,7 @@ namespace f4sr
 	namespace
 	{
 		// Texture size is the upper bound; the card is cut to the text.
-		constexpr UINT kMaxW = 960, kMaxH = 420;
+		constexpr UINT kMaxW = 960, kMaxH = 560;
 		constexpr int kLine = 32, kPadX = 26, kPadTop = 16, kPadBottom = 18, kValueGap = 22, kAccent = 5, kRadius = 14;
 		constexpr int kMargin = 16;  // from the back buffer's top-left corner
 		constexpr std::uint8_t kBgR = 14, kBgG = 17, kBgB = 24;
@@ -357,6 +357,12 @@ float4 ps(V i) : SV_Target
 	{
 		Microsoft::WRL::ComPtr<ID3D11Texture2D> backbuffer;
 		if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(backbuffer.GetAddressOf())))) return;
+		DrawTo(backbuffer.Get(), variant, build);
+	}
+
+	void FgOverlay::DrawTo(ID3D11Texture2D* backbuffer, int variant, const Builder& build)
+	{
+		if (!backbuffer) return;
 		D3D11_TEXTURE2D_DESC desc{}; backbuffer->GetDesc(&desc);
 		if ((desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) ||
 			desc.SampleDesc.Count != 1 || desc.Width < kMaxW + 2 * kMargin || desc.Height < kMaxH + 2 * kMargin) return;
@@ -373,13 +379,13 @@ float4 ps(V i) : SV_Target
 		const int index = variant ? 1 : 0;
 		if (!panels_[index]) return;
 		Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx; device->GetImmediateContext(ctx.GetAddressOf());
-		if ((desc.BindFlags & D3D11_BIND_RENDER_TARGET) && Blend(ctx.Get(), backbuffer.Get(), index)) return;
+		if ((desc.BindFlags & D3D11_BIND_RENDER_TARGET) && Blend(ctx.Get(), backbuffer, index)) return;
 		// Fallback: opaque copy of the premultiplied card.
 		ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
 		ID3D11DepthStencilView* dsv{};
 		ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
 		ctx->OMSetRenderTargets(0, nullptr, nullptr);
-		ctx->CopySubresourceRegion(backbuffer.Get(), 0, kMargin, kMargin, 0, panels_[index].Get(), 0, nullptr);
+		ctx->CopySubresourceRegion(backbuffer, 0, kMargin, kMargin, 0, panels_[index].Get(), 0, nullptr);
 		ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
 		for (auto* rtv : rtvs) if (rtv) rtv->Release();
 		if (dsv) dsv->Release();
