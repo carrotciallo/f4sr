@@ -1,3 +1,4 @@
+#include "vram_budget.h"
 #include "sr_status.h"
 #include "version.h"
 #include "xefg_presenter.h"
@@ -14,6 +15,7 @@
 #include <intrin.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include "ffx_antilag2_dx12.h"
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -22,6 +24,9 @@
 #include <cstring>
 #include "frame_pipeline_detail.h"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <cmath>
@@ -29,6 +34,7 @@
 #include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "F4SE/F4SE.h"
 #include "RE/Fallout.h"
@@ -295,6 +301,7 @@ namespace
 	}
 
 	constexpr UINT kProxyBuffers = 8;  // 4X bursts queue up to 4 flips per real frame
+	constexpr UINT kPlainBuffers = 3;  // UI Native without XeSS-FG: one real frame per Present
 
 	struct Api
 	{
@@ -377,8 +384,18 @@ namespace
 		else F4SE::log::warn("f4sr: libxess_fg: {}", message ? message : "");
 	}
 
+	// Set around the first xellSleep after the low-latency setting switches
+	// back to XeLL. While Anti-Lag 2 or Off was in effect xellSleep was not
+	// called, so XeLL still expects the frame after the last one it slept on and
+	// reports the jump once (it resynchronises on that call).
+	std::atomic<bool> g_xellResync{};
+
 	void XellLog(const char* message, xell_logging_level_t level)
 	{
+		if (message && g_xellResync.load(std::memory_order_relaxed) && std::string_view(message).starts_with("Sleep() called for frame")) {
+			F4SE::log::info("f4sr: libxell: {} (expected once after switching back to XeLL)", message);
+			return;
+		}
 		if (level >= XELL_LOGGING_LEVEL_ERROR) F4SE::log::error("f4sr: libxell: {}", message ? message : "");
 		else F4SE::log::warn("f4sr: libxell: {}", message ? message : "");
 	}
@@ -845,6 +862,16 @@ namespace
 	HRESULT STDMETHODCALLTYPE PresentThunk(IDXGISwapChain* chain, UINT syncInterval, UINT flags);
 	HRESULT STDMETHODCALLTYPE InnerPresentThunk(IDXGISwapChain* chain, UINT syncInterval, UINT flags);
 
+	// AMD Anti-Lag 2 on the interop D3D12 device (Settings::lowLatency 2).
+	// Frame types come from the provider's present thread through the pacing
+	// hook; they are reported only while AL2 is active and generation is on.
+	AMD::AntiLag2DX12::Context g_al2{};
+	std::atomic<bool> g_al2FrameTypes{ false };
+	void Al2FrameType(bool generated)
+	{
+		if (g_al2FrameTypes.load(std::memory_order_relaxed)) AMD::AntiLag2DX12::SetFrameGenFrameType(&g_al2, generated);
+	}
+
 	struct Presenter
 	{
 		Api api;
@@ -872,6 +899,8 @@ namespace
 		std::atomic<std::uint32_t> reshadeDepthGeneration{};
 		bool attached{};
 		int maxInterpolations{ 1 };
+		bool fgLoaded{};              // XeFG context and proxy chain loaded (else a plain chain)
+		vram_budget::SdkBytes fgSdkBytes;  // XeFG internal resources (measured)
 		int appliedInterpolations{ 0 };
 		bool fgEnabled{};
 		bool resetNext{ true };
@@ -879,7 +908,7 @@ namespace
 		// Frame state. The XeLL frame id doubles as the XeFG present id.
 		std::uint32_t frameId{ 1 };
 		bool simStarted{}, renderStarted{};
-		bool inputsReady{}, hudlessReady{};
+		bool inputsReady{}, hudlessReady{}, hudlessFailed{};
 		XeFGFrameInputs inputs{};
 		std::optional<FrameCamera> camera;  // captured with the inputs, mid-frame
 
@@ -889,6 +918,419 @@ namespace
 		std::uint64_t statHistogram[6]{};
 		int lastGenResult{}, lastGenWarning{};
 		const char* lastOff{ "not started" };
+
+		// Hot diagnostics for low GPU clocks under the proxy chain (AMD report,
+		// 2026-11-25). Re-read from f4sr.ini while running; not in the packaged ini.
+		//   iXeLLSleep       1 = low-latency mode + xellSleep every frame (default)
+		//                    0 = low-latency mode off, xellSleep not called
+		//                    2 = low-latency mode on, xellSleep only while generating
+		//                    3 = low-latency mode on, xellSleep never called
+		// XeFG reads the mode when generation is enabled and keeps it: with the
+		// mode off at that moment it presents no generated frames (no error)
+		// until generation is toggled again, so only 0 turns the mode off.
+		//   iXeFGGamePresent 1 = also Present the hidden game chain (interval 0,
+		//                    DO_NOT_WAIT) so the D3D11 driver sees frame boundaries
+		//   iXeFGFenceWait   0 = skip the D3D11 GPU wait on the D3D12 copy fence
+		//                    (the next frame may overwrite a copy still being read)
+		//   iXeFGPacing      0 = forward provider presents unpaced (xefg_pacing off)
+		//   iXeFGBlockComp   1 = take the game thread's proxy Present time out of the pacing period (experiment, default off)
+		int diagXellSleep{ 1 }, diagGamePresent{ 0 }, diagFenceWait{ 1 }, diagPacing{ 1 }, diagBlockComp{ 0 };
+		double statBlockMs{};
+		std::uint64_t statBlockCount{};
+		int appliedLowLatency{ 1 };
+		std::uint64_t statGamePresentOk{}, statGamePresentBusy{}, statGamePresentFailed{};
+		HRESULT lastGamePresentHr{ S_OK };
+
+		bool DiagNonDefault() const { return diagXellSleep != 1 || diagGamePresent != 0 || diagFenceWait != 1 || diagPacing != 1 || diagBlockComp != 0; }
+
+		void ReadDiagnostics()
+		{
+			auto read = [](const char* key, int& value, int fallback, int lo, int hi) {
+				int now = PluginIniInt(key, fallback);
+				if (now < lo || now > hi) now = fallback;
+				if (now != value) F4SE::log::info("f4sr: diagnostics: {} {} -> {}", key, value, now);
+				value = now;
+			};
+			read("iXeLLSleep", diagXellSleep, 1, 0, 3);
+			read("iXeFGGamePresent", diagGamePresent, 0, 0, 1);
+			read("iXeFGFenceWait", diagFenceWait, 1, 0, 1);
+			read("iXeFGPacing", diagPacing, 1, 0, 1);
+			if (xefg_pacing::g.installed) xefg_pacing::g.enabled.store(diagPacing != 0, std::memory_order_relaxed);
+			read("iXeFGBlockComp", diagBlockComp, 0, 0, 1);
+			xefg_pacing::g.blockComp.store(diagBlockComp != 0, std::memory_order_relaxed);
+		}
+
+		// Low-latency mode as iXeLLSleep asks for it this frame; returns whether
+		// xellSleep should run.
+		bool ApplySleepMode(bool generating)
+		{
+			if (!xell) return false;
+			const int want = diagXellSleep == 0 ? 0 : 1;
+			const bool sleep = diagXellSleep == 1 || (diagXellSleep == 2 && generating);
+			if (want != appliedLowLatency) {
+				xell_sleep_params_t p{};
+				p.bLowLatencyMode = static_cast<std::uint32_t>(want);
+				const bool ok = Ok(api.xellSetSleepMode(xell, &p), "xellSetSleepMode");
+				static std::uint32_t logged = 0;
+				if (logged++ < 20) F4SE::log::info("f4sr: diagnostics: XeLL low-latency mode {} ({})", want ? "on" : "off", ok ? "ok" : "failed");
+				appliedLowLatency = want;
+			}
+			return sleep;
+		}
+
+		// Low latency (Settings::lowLatency, live). XeLL's low-latency mode stays
+		// on for every choice: XeFG reads it when generation is enabled and
+		// presents no generated frames if it was off (verified 2026-11-25).
+		enum class Latency { Off, XeLL, AntiLag2 };
+		Latency latencyApplied{ Latency::XeLL };
+		bool xellResyncNext{};  // next xellSleep follows a stretch without one
+		bool al2Tried{}, al2Ok{};
+		HRESULT al2Hr{ E_PENDING };
+		std::uint64_t statAl2Calls{};
+		double statAl2Ms{}, statAl2MaxMs{};
+
+		static const char* LatencyName(Latency l)
+		{
+			return l == Latency::Off ? "off" : (l == Latency::AntiLag2 ? "Anti-Lag 2" : "XeLL");
+		}
+
+		static Latency LatencyWanted()
+		{
+			switch (GetSettings().lowLatency) {
+			case 0: return Latency::Off;
+			case 2: return Latency::AntiLag2;
+			default: return Latency::XeLL;
+			}
+		}
+
+		bool InitAntiLag2()
+		{
+			if (al2Tried) return al2Ok;
+			al2Tried = true;
+			// Provided by the AMD driver, or by vkd3d-proton under Proton. Kept loaded.
+			LoadLibraryA("amdxc64.dll");
+			al2Hr = interop.Device12() ? AMD::AntiLag2DX12::Initialize(&g_al2, interop.Device12()) : E_POINTER;
+			al2Ok = al2Hr == S_OK;
+			F4SE::log::info("f4sr: low latency: Anti-Lag 2 on the interop D3D12 device {} (hr 0x{:08X})",
+				al2Ok ? "available" : "unavailable, XeLL is used instead", static_cast<std::uint32_t>(al2Hr));
+			if (al2Ok) xefg_pacing::g.frameType.store(&Al2FrameType, std::memory_order_relaxed);
+			return al2Ok;
+		}
+
+		// Switches the backend to the setting (AL2 falls back to XeLL); returns the one in effect.
+		Latency ApplyLatency()
+		{
+			Latency want = LatencyWanted();
+			if (want == Latency::AntiLag2 && !InitAntiLag2()) want = Latency::XeLL;
+			if (want != latencyApplied) {
+				if (latencyApplied == Latency::AntiLag2) AMD::AntiLag2DX12::Update(&g_al2, false, 0);
+				if (want == Latency::XeLL) xellResyncNext = true;
+				F4SE::log::info("f4sr: low latency: {} -> {}", LatencyName(latencyApplied), LatencyName(want));
+				latencyApplied = want;
+				statAl2Calls = 0;
+				statAl2Ms = statAl2MaxMs = 0.0;
+			}
+			return want;
+		}
+
+		// Panel: only the diagnostic switches that differ from the default.
+		std::string DiagPanel() const
+		{
+			static constexpr const char* kSleep[] = { "off", "always", "while generating", "mode on, no sleep" };
+			std::string out;
+			auto add = [&](std::string item) { out += (out.empty() ? "" : ", ") + item; };
+			if (diagXellSleep != 1) add(std::string("XeLL sleep ") + kSleep[diagXellSleep]);
+			if (diagGamePresent != 0) add("game Present on");
+			if (diagFenceWait != 1) add("fence wait off");
+			if (diagPacing != 1) add("pacing off");
+			if (diagBlockComp != 0) add("block comp on");
+			return out;
+		}
+
+		std::string DiagSummary() const
+		{
+			static constexpr const char* kSleep[] = { "off", "always", "while generating", "mode on, no sleep" };
+			return std::format("XeLL sleep {}, game Present {}, fence wait {}, pacing {}, block comp {}, async present {}", kSleep[diagXellSleep],
+				diagGamePresent ? "on" : "off", diagFenceWait ? "on" : "off", diagPacing ? "on" : "off", diagBlockComp ? "on" : "off",
+				!asyncWanted ? "off" : (asyncActive ? std::format("on, queue {}", asyncQueue) : std::string("on (paused: ReShade depth)")));
+		}
+
+		// Asynchronous presentation (iXeFGAsyncPresent=1, read at attach;
+		// experiment, default off). The provider's present thread holds each
+		// real frame for the pacing interval and its queue is about one frame
+		// deep, so the game thread used to block 6-10 ms in the proxy Present
+		// (2026-11-26). With this on, the game thread only copies the frame's
+		// shared textures into one of two hand-off slots and queues it; a
+		// worker thread records the D3D12 copy, tags the XeFG inputs and calls
+		// the proxy Present. The game thread waits when the worker is more than
+		// iXeFGAsyncQueue frames behind. The textures the frame writes elsewhere (back
+		// buffer, HUD-less, depth, motion) stay D3D11-only in this mode.
+		// ReShade's output-chain depth is still read during the proxy Present,
+		// so the synchronous path is used while ReShade wants depth. On the
+		// Classic pipeline that is the whole session when ReShade Depth is on
+		// (no before-upscaling pass; depth is read after the UI), so async
+		// present only takes effect there with ReShade Depth off.
+		struct AsyncSlot
+		{
+			SharedTexture back, hudless, depth, motion;
+		};
+		struct AsyncJob
+		{
+			std::uint32_t id{};
+			std::uint64_t seq{};
+			bool generate{};
+			bool al2{};
+			int interpolations{};
+			UINT renderWidth{}, renderHeight{};
+			xefg_swapchain_frame_constant_data_t constants{};
+		};
+		bool asyncWanted{};
+		bool asyncActive{};
+		// iXeFGAsyncQueue: frames the game thread may run ahead of the worker.
+		// 1 = hand off only after the worker finished the previous frame (the
+		// worker's Present overlaps the next game frame; little added latency).
+		// 2 = one more frame queued (2026-11-26 test: about +25 ms latency).
+		int asyncQueue{ 1 };
+		AsyncSlot asyncSlots[2];
+		std::uint64_t asyncSeq{};  // game thread: last frame handed off
+		std::thread asyncThread;
+		std::mutex asyncMutex;
+		std::condition_variable asyncCv;
+		std::optional<AsyncJob> asyncPending;  // guarded by asyncMutex
+		bool asyncBusy{};                       // guarded by asyncMutex
+		bool asyncStop{};                       // guarded by asyncMutex
+		std::uint64_t asyncDone{};              // guarded by asyncMutex: last finished sequence
+		std::atomic<bool> asyncDropped{};       // worker could not present a generation frame
+		std::atomic<std::uint64_t> asyncWaitNs{}, asyncWaitFrames{}, asyncWaitMaxNs{};
+
+		~Presenter()
+		{
+			// Static destruction at process exit runs after the OS ended the
+			// worker; joining then would hang and destroying a joinable
+			// std::thread would terminate.
+			if (asyncThread.joinable()) asyncThread.detach();
+		}
+
+		void AsyncStart()
+		{
+			if (asyncThread.joinable()) return;
+			{
+				std::lock_guard lock(asyncMutex);
+				asyncStop = false;
+			}
+			asyncThread = std::thread([this] { AsyncLoop(); });
+		}
+
+		// Blocks until the worker has finished every queued frame.
+		void AsyncIdle()
+		{
+			if (!asyncThread.joinable()) return;
+			std::unique_lock lock(asyncMutex);
+			asyncCv.wait(lock, [&] { return !asyncPending && !asyncBusy; });
+		}
+
+		void AsyncShutdown()
+		{
+			if (asyncThread.joinable()) {
+				{
+					std::lock_guard lock(asyncMutex);
+					asyncStop = true;
+				}
+				asyncCv.notify_all();
+				asyncThread.join();
+			}
+			asyncPending.reset();
+			asyncBusy = false;
+			asyncDone = asyncSeq = 0;
+			asyncActive = false;
+			for (auto& slot : asyncSlots) slot = {};
+		}
+
+		void AsyncLoop()
+		{
+			SetThreadDescription(GetCurrentThread(), L"f4sr XeFG present");
+			for (;;) {
+				AsyncJob job;
+				{
+					std::unique_lock lock(asyncMutex);
+					asyncCv.wait(lock, [&] { return asyncStop || asyncPending.has_value(); });
+					if (!asyncPending) return;  // stop requested and nothing queued
+					job = *asyncPending;
+					asyncPending.reset();
+					asyncBusy = true;
+				}
+				asyncCv.notify_all();
+				AsyncPresent(job);
+				{
+					std::lock_guard lock(asyncMutex);
+					asyncBusy = false;
+					asyncDone = job.seq;
+				}
+				asyncCv.notify_all();
+			}
+		}
+
+		// Game thread: async on while wanted and ReShade does not read depth.
+		void AsyncSelect()
+		{
+			const bool want = asyncWanted && !reshade_preui::WantsDepth();
+			if (want == asyncActive) return;
+			if (want && (!interop.CreateAsyncFences())) {
+				F4SE::log::error("f4sr: XeFG async present: shared fences unavailable; staying synchronous");
+				asyncWanted = false;
+				return;
+			}
+			AsyncIdle();
+			if (want) AsyncStart();
+			asyncActive = want;
+			F4SE::log::info("f4sr: XeFG async present {}", want ? "on" : "paused (ReShade reads depth during the proxy Present)");
+		}
+
+		// Game thread: the slot texture matches the frame's texture. A new size
+		// or format retires all in-flight work before the old one is released.
+		bool AsyncEnsure(SharedTexture& slot, const SharedTexture& work)
+		{
+			if (!work.tex11) return false;
+			if (slot.tex11 && slot.desc.Width == work.desc.Width && slot.desc.Height == work.desc.Height && slot.desc.Format == work.desc.Format &&
+				slot.desc.BindFlags == work.desc.BindFlags)
+				return true;
+			AsyncIdle();
+			if (slot.tex11 && !interop.Drain()) return false;
+			slot = {};
+			return interop.CreateSharedTexture(work.desc, slot);
+		}
+
+		// Game thread: hands the finished frame to the worker. Returns false
+		// when nothing was queued (the frame is then not shown).
+		bool AsyncSubmit(std::uint32_t id, const char* block)
+		{
+			const std::uint64_t seq = asyncSeq + 1;
+			auto& slot = asyncSlots[seq & 1];
+			const bool generate = !block;
+			SetStep(Step::ProxyPresent, id);
+			const auto waitStart = std::chrono::steady_clock::now();
+			{
+				// Slot seq & 1 was last used by seq - 2; at most asyncQueue frames in flight.
+				std::unique_lock lock(asyncMutex);
+				if (!asyncCv.wait_for(lock, std::chrono::seconds(5), [&] { return !asyncPending && asyncDone + asyncQueue >= seq; })) {
+					static std::uint32_t warned = 0;
+					if (warned++ < 10) F4SE::log::error("f4sr: XeFG async present: worker did not finish frame {} within 5 s", seq - asyncQueue);
+					return false;
+				}
+			}
+			const auto waitNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count());
+			asyncWaitNs.fetch_add(waitNs, std::memory_order_relaxed);
+			asyncWaitFrames.fetch_add(1, std::memory_order_relaxed);
+			if (waitNs > asyncWaitMaxNs.load(std::memory_order_relaxed)) asyncWaitMaxNs.store(waitNs, std::memory_order_relaxed);
+
+			SetStep(Step::Copy, id);
+			if (!AsyncEnsure(slot.back, back) ||
+				(generate && (!AsyncEnsure(slot.hudless, hudless) || !AsyncEnsure(slot.depth, depth) || !AsyncEnsure(slot.motion, motion)))) {
+				static std::uint32_t warned = 0;
+				if (warned++ < 10) F4SE::log::error("f4sr: XeFG async present: hand-off texture creation failed");
+				return false;
+			}
+			// The slot's D3D12 reads from frame seq - 2 (its proxy Present
+			// included) finish before D3D11 overwrites it.
+			if (seq > 2 && !interop.WaitRetiredOnD3D11(ctx11.Get(), seq - 2)) return false;
+			ctx11->CopyResource(slot.back.tex11.Get(), back.tex11.Get());
+			if (generate) {
+				ctx11->CopyResource(slot.hudless.tex11.Get(), hudless.tex11.Get());
+				ctx11->CopyResource(slot.depth.tex11.Get(), depth.tex11.Get());
+				ctx11->CopyResource(slot.motion.tex11.Get(), motion.tex11.Get());
+			}
+			if (!interop.SignalReadyFromD3D11(ctx11.Get(), seq)) return false;
+			asyncSeq = seq;
+
+			AsyncJob job{};
+			job.id = id;
+			job.seq = seq;
+			job.generate = generate;
+			job.al2 = latencyApplied == Latency::AntiLag2;
+			job.interpolations = GetSettings().xefgInterpolations;
+			if (generate) {
+				job.renderWidth = inputs.renderWidth;
+				job.renderHeight = inputs.renderHeight;
+				auto& c = job.constants;
+				Matrices(*camera, static_cast<float>(width) / static_cast<float>(height), c.viewMatrix, c.projectionMatrix);
+				c.jitterOffsetX = inputs.jitterX;
+				c.jitterOffsetY = inputs.jitterY;
+				c.motionVectorScaleX = static_cast<float>(inputs.renderWidth);
+				c.motionVectorScaleY = static_cast<float>(inputs.renderHeight);
+				const bool dropped = asyncDropped.exchange(false, std::memory_order_relaxed);
+				c.resetHistory = (inputs.reset || resetNext || dropped) ? 1u : 0u;
+				const double paced = xefg_pacing::RenderTimeMs();
+				c.frameRenderTime = paced > 0.0 ? static_cast<float>(paced) : inputs.frameTimeMs;
+			}
+			{
+				std::lock_guard lock(asyncMutex);
+				asyncPending = job;
+			}
+			asyncCv.notify_all();
+			return true;
+		}
+
+		// Worker thread: what the synchronous path does after the D3D11 copy.
+		// Owns fgEnabled, appliedInterpolations and the 5 s statistics while
+		// async present is on; the panel reads them without locking.
+		void AsyncPresent(const AsyncJob& job)
+		{
+			const auto& slot = asyncSlots[job.seq & 1];
+			bool presented = false;
+			if (interop.WaitReadyOnD3D12(job.seq)) {
+				auto* list = interop.BeginFrame();
+				ComPtr<ID3D12Resource> target;
+				if (list && SUCCEEDED(proxy->GetBuffer(proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&target)))) {
+					D3D12Interop::Transition(list, target.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+					D3D12Interop::Transition(list, slot.back.res12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+					list->CopyResource(target.Get(), slot.back.res12.Get());
+					D3D12Interop::Transition(list, slot.back.res12.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+					D3D12Interop::Transition(list, target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+					if (job.generate) {
+						Tag(list, job.id, XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, slot.hudless.res12.Get(), outWidth, outHeight);
+						Tag(list, job.id, XEFG_SWAPCHAIN_RES_DEPTH, slot.depth.res12.Get(), job.renderWidth, job.renderHeight);
+						Tag(list, job.id, XEFG_SWAPCHAIN_RES_MOTION_VECTOR, slot.motion.res12.Get(), job.renderWidth, job.renderHeight);
+						auto c = job.constants;
+						api.tagConstants(fg, job.id, &c);
+					}
+					presented = interop.EndFrame();
+				} else if (list) {
+					interop.EndFrame();
+				}
+			}
+			const bool fgFrame = presented && job.generate;
+			if (fg && fgFrame != fgEnabled) {
+				api.setEnabled(fg, fgFrame ? 1u : 0u);
+				fgEnabled = fgFrame;
+			}
+			if (fgFrame) ApplyInterpolations(job.interpolations);
+			else if (job.generate) asyncDropped.store(true, std::memory_order_relaxed);
+			if (presented) {
+				if (fg) api.setPresentId(fg, job.id);
+				Marker(job.id, XELL_PRESENT_START);
+				xefg_pacing::NoteAppSubmit(job.id);
+				const bool al2Fg = fgFrame && job.al2;
+				if (al2Fg) AMD::AntiLag2DX12::MarkEndOfFrameRendering(&g_al2);
+				g_al2FrameTypes.store(al2Fg, std::memory_order_relaxed);
+				const auto presentStart = std::chrono::steady_clock::now();
+				const HRESULT hr12 = proxy->Present(1, 0);
+				const auto blockNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - presentStart).count();
+				if (fgFrame) xefg_pacing::NoteAppBlock(blockNs);
+				statBlockMs += blockNs / 1e6;
+				++statBlockCount;
+				Marker(job.id, XELL_PRESENT_END);
+				if (FAILED(hr12)) F4SE::log::warn("f4sr: XeFG proxy Present hr=0x{:08X}", static_cast<std::uint32_t>(hr12));
+				xefg_swapchain_present_status_t status{};
+				Stats(PresentStatus(status) ? &status : nullptr, fgFrame);
+			} else {
+				Marker(job.id, XELL_PRESENT_START);
+				Marker(job.id, XELL_PRESENT_END);
+				static std::uint64_t warned = 0;
+				if ((warned++ % 600) == 0) F4SE::log::warn("f4sr: XeFG async present: frame {} not presented on the proxy chain", job.id);
+			}
+			// Always signalled, so the slot is reusable even after a failure.
+			if (!interop.SignalRetiredFromD3D12(job.seq)) F4SE::log::error("f4sr: XeFG async present: retired signal failed");
+		}
 
 		// Diagnostics panel (bFrameGenOverlay): cumulative counters turned into rates.
 		bool unlockApplied{};
@@ -901,6 +1343,20 @@ namespace
 		void Marker(std::uint32_t id, xell_latency_marker_type_t m)
 		{
 			if (xell) api.xellMarker(xell, id, m);
+		}
+
+		// Game thread. Created on first use: frame generation off never needs it.
+		bool EnsureHudless()
+		{
+			if (hudless.tex11) return true;
+			if (hudlessFailed) return false;
+			if (!CreateTexture(hudless, outWidth, outHeight, format, scaling)) {
+				hudlessFailed = true;
+				F4SE::log::error("f4sr: XeFG: shared HUD-less texture creation failed");
+				return false;
+			}
+			vram_budget::Note("XeFG shared HUD-less texture (frame generation on)", outWidth, outHeight, format);
+			return true;
 		}
 
 		bool CreateTexture(SharedTexture& out, UINT w, UINT h, DXGI_FORMAT f, bool renderTarget = false)
@@ -918,8 +1374,10 @@ namespace
 
 		void Teardown()
 		{
+			AsyncShutdown();
 			if (fg) api.destroy(fg);
 			if (xell) api.xellDestroy(xell);
+			fgSdkBytes.Set(0);
 			fg = nullptr;
 			xell = nullptr;
 			proxy.Reset();
@@ -927,6 +1385,7 @@ namespace
 			enbDelta = {};
 			back = {};
 			hudless = {};
+			hudlessFailed = false;
 			depth = {};
 			motion = {};
 			reshadeDepth = {};
@@ -948,18 +1407,34 @@ namespace
 			realWindow = real;
 			hiddenWindow = hidden;
 			if (!api.Load()) return false;
+			vram_budget::Init(device);
+			const auto vramDevice = vram_budget::LocalUsage();
 			if (!interop.Create(device)) {
 				F4SE::log::error("f4sr: XeFG: D3D12 interop device creation failed");
 				return false;
 			}
+			vram_budget::NoteDelta("XeFG D3D12 interop device", vramDevice);
 			device11 = device;
 			device->GetImmediateContext(&ctx11);
 
-			const auto unlock = xefg_unlock::Apply(api.fg, api.xell, xefg_unlock::kMaxInterpolations);
-			maxInterpolations = unlock.maxInterpolations;
-			unlockApplied = unlock.unlocked;
-			unlockFailure = unlock.failure;
-			if (unlock.unlocked && unlock.pacingSitesOk) xefg_pacing::Install(api.fg);
+			// UI Native presents through this chain with or without frame
+			// generation. Started with frame generation off, it uses a plain
+			// 3-buffer chain and XeSS-FG is not loaded: at 4K that saves about
+			// 1 GB (the 8-buffer proxy chain plus XeFG's internal resources).
+			// Turning frame generation on then needs a restart.
+			// bXeFGAlwaysLoad=1 restores the previous behaviour.
+			const bool alwaysLoad = PluginIniInt("bXeFGAlwaysLoad", 0) == 1;
+			fgLoaded = !scaling || GetSettings().enableFrameGeneration || alwaysLoad;
+			xefg_unlock::Result unlock{};
+			if (fgLoaded) {
+				unlock = xefg_unlock::Apply(api.fg, api.xell, xefg_unlock::kMaxInterpolations);
+				maxInterpolations = unlock.maxInterpolations;
+				unlockApplied = unlock.unlocked;
+				unlockFailure = unlock.failure;
+				if (unlock.unlocked && unlock.pacingSitesOk) xefg_pacing::Install(api.fg);
+			} else {
+				unlockApplied = true;
+			}
 
 			if (!Ok(api.xellCreate(interop.Device12(), &xell), "xellD3D12CreateContext") || !xell) {
 				F4SE::log::error("f4sr: XeFG: xellD3D12CreateContext failed (XeSS-FG requires XeLL)");
@@ -971,16 +1446,6 @@ namespace
 			sleep.bLowLatencyMode = 1;
 			if (!Ok(api.xellSetSleepMode(xell, &sleep), "xellSetSleepMode")) F4SE::log::warn("f4sr: XeFG: xellSetSleepMode failed");
 
-			if (!Ok(api.createContext(interop.Device12(), &fg), "xefgSwapChainD3D12CreateContext") || !fg) {
-				F4SE::log::error("f4sr: XeFG: xefgSwapChainD3D12CreateContext failed");
-				fg = nullptr;
-				return false;
-			}
-			api.setLogging(fg, XEFG_SWAPCHAIN_LOGGING_LEVEL_WARNING, &XefgLog, nullptr);
-			if (!Ok(api.setLatencyReduction(fg, xell), "xefgSwapChainSetLatencyReduction")) {
-				F4SE::log::error("f4sr: XeFG: xefgSwapChainSetLatencyReduction failed");
-				return false;
-			}
 			ComPtr<IDXGIFactory2> factory;
 			if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
 				F4SE::log::error("f4sr: XeFG: CreateDXGIFactory2 failed");
@@ -992,38 +1457,80 @@ namespace
 			desc.Format = format;
 			desc.SampleDesc.Count = 1;
 			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-			desc.BufferCount = kProxyBuffers;
+			desc.BufferCount = fgLoaded ? kProxyBuffers : kPlainBuffers;
 			desc.Scaling = DXGI_SCALING_STRETCH;
 			desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 			desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-			xefg_swapchain_d3d12_init_params_t params{};
-			params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;  // standard depth, render-res UV MVs scaled to pixels, unjittered MVs
-			params.maxInterpolatedFrames = static_cast<std::uint32_t>(maxInterpolations);
-			params.uiMode = XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS;
-			const auto init = api.initFromDesc(fg, real, &desc, nullptr, interop.Queue12(), factory.Get(), &params);
-			if (!Ok(init, "xefgSwapChainD3D12InitFromSwapChainDesc")) {
-				F4SE::log::error("f4sr: XeFG: xefgSwapChainD3D12InitFromSwapChainDesc failed ({})", static_cast<int>(init));
-				return false;
-			}
-			if (!Ok(api.getSwapChain(fg, IID_PPV_ARGS(&proxy)), "xefgSwapChainD3D12GetSwapChainPtr") || !proxy) {
-				F4SE::log::error("f4sr: XeFG: proxy swap chain (IDXGISwapChain3) unavailable");
-				return false;
-			}
-			if (!CreateTexture(back, outWidth, outHeight, format, scaling) || !CreateTexture(hudless, outWidth, outHeight, format, scaling)) {
-				F4SE::log::error("f4sr: XeFG: shared back buffer / HUD-less texture creation failed");
-				return false;
-			}
+			const auto vramBefore = vram_budget::LocalUsage();
 			xefg_swapchain_properties_t props{};
-			const auto propsResult = api.properties(fg, &props);
-			api.setEnabled(fg, 0);
-			// uiMode only takes effect with UI composition enabled (off by
-			// default): without it the whole back buffer, HUD included, is
-			// interpolated and the crosshair moves with the scene.
-			if (api.setUiComposition) {
-				const auto ui = api.setUiComposition(fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED);
-				F4SE::log::info("f4sr: XeFG: UI composition enabled (mode back buffer + HUD-less) result {}", static_cast<int>(ui));
+			auto propsResult = XEFG_SWAPCHAIN_RESULT_SUCCESS;
+			if (fgLoaded) {
+				if (!Ok(api.createContext(interop.Device12(), &fg), "xefgSwapChainD3D12CreateContext") || !fg) {
+					F4SE::log::error("f4sr: XeFG: xefgSwapChainD3D12CreateContext failed");
+					fg = nullptr;
+					return false;
+				}
+				api.setLogging(fg, XEFG_SWAPCHAIN_LOGGING_LEVEL_WARNING, &XefgLog, nullptr);
+				if (!Ok(api.setLatencyReduction(fg, xell), "xefgSwapChainSetLatencyReduction")) {
+					F4SE::log::error("f4sr: XeFG: xefgSwapChainSetLatencyReduction failed");
+					return false;
+				}
+				xefg_swapchain_d3d12_init_params_t params{};
+				params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;  // standard depth, render-res UV MVs scaled to pixels, unjittered MVs
+				params.maxInterpolatedFrames = static_cast<std::uint32_t>(maxInterpolations);
+				params.uiMode = XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS;
+				const auto init = api.initFromDesc(fg, real, &desc, nullptr, interop.Queue12(), factory.Get(), &params);
+				if (!Ok(init, "xefgSwapChainD3D12InitFromSwapChainDesc")) {
+					F4SE::log::error("f4sr: XeFG: xefgSwapChainD3D12InitFromSwapChainDesc failed ({})", static_cast<int>(init));
+					return false;
+				}
+				if (!Ok(api.getSwapChain(fg, IID_PPV_ARGS(&proxy)), "xefgSwapChainD3D12GetSwapChainPtr") || !proxy) {
+					F4SE::log::error("f4sr: XeFG: proxy swap chain (IDXGISwapChain3) unavailable");
+					return false;
+				}
+				propsResult = api.properties(fg, &props);
+				vram_budget::NoteDelta("XeFG proxy swap chain + context", vramBefore);
+				{
+					const std::uint64_t chainBytes = static_cast<std::uint64_t>(outWidth) * outHeight * vram_budget::BytesPerPixel(format) * kProxyBuffers;
+					vram_budget::Track(proxy.Get(), vram_budget::Kind::Chain, chainBytes);
+					if (vramBefore)
+						fgSdkBytes.Set(static_cast<std::int64_t>(vram_budget::LocalUsage()) - static_cast<std::int64_t>(vramBefore) - static_cast<std::int64_t>(chainBytes));
+				}
+				vram_budget::Note("XeFG proxy swap chain buffers", outWidth, outHeight, format, kProxyBuffers);
+				if (propsResult == XEFG_SWAPCHAIN_RESULT_SUCCESS)
+					vram_budget::NoteBytes("XeFG temporary heaps (buffers + textures, SDK-reported)", props.tempBufferHeapSize + props.tempTextureHeapSize);
 			} else {
-				F4SE::log::warn("f4sr: XeFG: xefgSwapChainSetUiCompositionState not exported; UI is interpolated with the scene");
+				// Same description as the XeFG chain, fewer buffers: no
+				// generated frames queue behind the real one.
+				ComPtr<IDXGISwapChain1> plain;
+				const HRESULT hr = factory->CreateSwapChainForHwnd(interop.Queue12(), real, &desc, nullptr, nullptr, &plain);
+				if (FAILED(hr) || FAILED(plain.As(&proxy))) {
+					F4SE::log::error("f4sr: UI Native: output swap chain creation failed (hr 0x{:08X})", static_cast<std::uint32_t>(hr));
+					return false;
+				}
+				vram_budget::NoteDelta("UI Native output swap chain", vramBefore);
+				vram_budget::Track(proxy.Get(), vram_budget::Kind::Chain,
+					static_cast<std::uint64_t>(outWidth) * outHeight * vram_budget::BytesPerPixel(format) * kPlainBuffers);
+				vram_budget::Note("UI Native output swap chain buffers", outWidth, outHeight, format, kPlainBuffers);
+			}
+			// The HUD-less texture is created on the first generated frame
+			// (EnsureHudless): with frame generation off it is never read.
+			if (!CreateTexture(back, outWidth, outHeight, format, scaling)) {
+				F4SE::log::error("f4sr: XeFG: shared back buffer texture creation failed");
+				return false;
+			}
+			vram_budget::Note("XeFG shared back buffer", outWidth, outHeight, format);
+			if (fg) {
+				api.setEnabled(fg, 0);
+				// uiMode only takes effect with UI composition enabled (off by
+				// default): without it the whole back buffer, HUD included, is
+				// interpolated and the crosshair moves with the scene.
+				if (api.setUiComposition) {
+					const auto ui = api.setUiComposition(fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED);
+					F4SE::log::info("f4sr: XeFG: UI composition enabled (mode back buffer + HUD-less) result {}", static_cast<int>(ui));
+				} else {
+					F4SE::log::warn("f4sr: XeFG: xefgSwapChainSetUiCompositionState not exported; UI is interpolated with the scene");
+				}
 			}
 
 			// Present hook on the game chain object (vtable shared per class).
@@ -1098,26 +1605,36 @@ namespace
 			if (!g_innerChain && anyEnb)
 				F4SE::log::warn("f4sr: XeFG: ENB found but no chain below it; frames are taken before ENB's Present (effects applied there are missing)");
 			if (!anyEnb && g_origResizeBuffers) enbResizeSupported = true;  // no ENB: the engine resizes the game chain directly
+			// Only with XeFG loaded: the plain chain has no pacing to wait out.
+			asyncWanted = GetSettings().asyncPresent && fgLoaded;
+			asyncQueue = std::clamp(PluginIniInt("iXeFGAsyncQueue", 1), 1, 2);
+			if (GetSettings().asyncPresent)
+				F4SE::log::info("f4sr: XeFG async present {} (queue {})", asyncWanted ? "requested" : "off: XeSS-FG not loaded", asyncQueue);
 			attached = true;
 			StartWatchdog();
 			if (scaling)
 				F4SE::log::info("f4sr: ENB before upscaling: game chain {}x{}, proxy chain {}x{} (pre-UI upscale; bilinear for menus and fallback)",
 					width, height, outWidth, outHeight);
-			F4SE::log::info("f4sr: XeFG attached: proxy chain {}x{} fmt={} buffers={} FLIP_DISCARD on game window {:p} (game chain on hidden window {:p}); "
-							"max generated frames {} ({}X, unlock {}), provider reports max {} (result {}); XeLL low-latency on",
-				outWidth, outHeight, static_cast<unsigned>(format), kProxyBuffers, static_cast<void*>(real), static_cast<void*>(hidden),
-				maxInterpolations, maxInterpolations + 1, unlock.unlocked ? "applied" : ("not applied: " + unlock.failure),
-				props.maxSupportedInterpolations, static_cast<int>(propsResult));
+			if (fgLoaded)
+				F4SE::log::info("f4sr: XeFG attached: proxy chain {}x{} fmt={} buffers={} FLIP_DISCARD on game window {:p} (game chain on hidden window {:p}); "
+								"max generated frames {} ({}X, unlock {}), provider reports max {} (result {}); XeLL low-latency on",
+					outWidth, outHeight, static_cast<unsigned>(format), kProxyBuffers, static_cast<void*>(real), static_cast<void*>(hidden),
+					maxInterpolations, maxInterpolations + 1, unlock.unlocked ? "applied" : ("not applied: " + unlock.failure),
+					props.maxSupportedInterpolations, static_cast<int>(propsResult));
+			else
+				F4SE::log::info("f4sr: UI Native output: plain swap chain {}x{} fmt={} buffers={} FLIP_DISCARD on game window {:p} (game chain on hidden window {:p}); "
+								"XeSS-FG not loaded (frame generation off at start; turning it on needs a restart, bXeFGAlwaysLoad=1 loads it anyway); XeLL on",
+					outWidth, outHeight, static_cast<unsigned>(format), kPlainBuffers, static_cast<void*>(real), static_cast<void*>(hidden));
 			return true;
 		}
 
-		void ApplyInterpolations()
+		void ApplyInterpolations(int setting)
 		{
-			const int want = std::clamp(GetSettings().xefgInterpolations, 1, maxInterpolations);
-			if (want == appliedInterpolations) return;
+			const int want = std::clamp(setting, 1, maxInterpolations);
+			if (!fg || want == appliedInterpolations) return;
 			const auto r = api.setInterpolations(fg, static_cast<std::uint32_t>(want));
 			F4SE::log::info("f4sr: XeFG generated frames per real frame -> {} ({}X) result {}{}", want, want + 1, static_cast<int>(r),
-				GetSettings().xefgInterpolations > maxInterpolations ? " (setting clamped: unlock not applied)" : "");
+				setting > maxInterpolations ? " (setting clamped: unlock not applied)" : "");
 			appliedInterpolations = want;
 		}
 
@@ -1162,6 +1679,7 @@ namespace
 		const char* GenerationBlock()
 		{
 			if (!GetSettings().enableFrameGeneration) return "disabled in settings";
+			if (!fg) return "XeSS-FG not loaded (started with frame generation off): restart";
 			if (!inputsReady) return "no SR inputs this frame";
 			if (!hudlessReady) return "no HUD-less capture this frame";
 			if (const char* menu = FrameGenMenuBlockReason()) return menu;
@@ -1187,6 +1705,17 @@ namespace
 			std::sort(toPresent.begin(), toPresent.end());
 			F4SE::log::info("f4sr: XeLL latency over {} frames: sim start -> present end median {:.2f} ms (max {:.2f}); sim start -> present start median {:.2f} ms",
 				total.size(), total[total.size() / 2], total.back(), toPresent[toPresent.size() / 2]);
+		}
+
+		// The plain chain (XeSS-FG not loaded) presents exactly the real frame.
+		bool PresentStatus(xefg_swapchain_present_status_t& status)
+		{
+			if (!fg) {
+				status = {};
+				status.framesPresented = 1;
+				return true;
+			}
+			return api.lastPresentStatus(fg, &status) == XEFG_SWAPCHAIN_RESULT_SUCCESS;
 		}
 
 		void Stats(const xefg_swapchain_present_status_t* status, bool fgFrame)
@@ -1216,6 +1745,27 @@ namespace
 							"(per real frame: 0:{} 1:{} 2:{} 3:{} 4:{} 5+:{}), status unavailable {}, generation errors {} (last {}), warnings {} (last {}); generated per real frame setting {}/{}",
 				statReal, statFgOn, lastOff, statPresented, statHistogram[0], statHistogram[1], statHistogram[2], statHistogram[3], statHistogram[4], statHistogram[5],
 				statStatusFailed, statGenErrors, lastGenResult, statGenWarnings, lastGenWarning, appliedInterpolations, maxInterpolations);
+			if (DiagNonDefault() || asyncWanted)
+				F4SE::log::info("f4sr: diagnostics 5s: {}; low-latency mode {}; game chain Presents ok {} busy {} failed {} (last hr 0x{:08X})", DiagSummary(),
+					appliedLowLatency ? "on" : "off", statGamePresentOk, statGamePresentBusy, statGamePresentFailed,
+					static_cast<std::uint32_t>(lastGamePresentHr));
+			statGamePresentOk = statGamePresentBusy = statGamePresentFailed = 0;
+			if (latencyApplied == Latency::AntiLag2 && statAl2Calls)
+				F4SE::log::info("f4sr: low latency 5s: Anti-Lag 2 Update {} calls, delay avg {:.2f} ms max {:.2f} ms", statAl2Calls,
+					statAl2Ms / static_cast<double>(statAl2Calls), statAl2MaxMs);
+			else if (latencyApplied != Latency::XeLL)
+				F4SE::log::info("f4sr: low latency 5s: {}", LatencyName(latencyApplied));
+			statAl2Calls = 0;
+			statAl2Ms = statAl2MaxMs = 0.0;
+			if (statBlockCount)
+				F4SE::log::info("f4sr: proxy Present on the game thread: avg {:.2f} ms over {} frames (pacing sees {:.2f} ms)", statBlockMs / static_cast<double>(statBlockCount),
+					statBlockCount, xefg_pacing::g.appBlockNs.load(std::memory_order_relaxed) / 1e6);
+			statBlockMs = 0.0;
+			statBlockCount = 0;
+			if (const auto frames = asyncWaitFrames.exchange(0, std::memory_order_relaxed))
+				F4SE::log::info("f4sr: XeFG async present: game thread waited for a hand-off slot avg {:.2f} ms max {:.2f} ms over {} frames (worker Present above)",
+					asyncWaitNs.exchange(0, std::memory_order_relaxed) / 1e6 / static_cast<double>(frames), asyncWaitMaxNs.exchange(0, std::memory_order_relaxed) / 1e6,
+					frames);
 			LogLatency();
 			statsTick = now;
 			statReal = statFgOn = statPresented = statStatusFailed = statGenErrors = statGenWarnings = 0;
@@ -1239,7 +1789,9 @@ namespace
 				overlayPresented = totalPresented;
 				const int setting = GetSettings().xefgInterpolations;
 				std::string fg, fps;
-				if (appliedInterpolations <= 0) {
+				if (!fgLoaded) {
+					fg = "FrameGen\toff (XeSS-FG not loaded)\n";
+				} else if (appliedInterpolations <= 0) {
 					fg = "FrameGen\t!XeSS-FG not applied yet\n";
 				} else if (fgEnabled) {
 					fg = std::format("FrameGen\tXeSS-FG {}X\n", appliedInterpolations + 1);
@@ -1248,11 +1800,16 @@ namespace
 					fg = std::format("FrameGen\tXeSS-FG {}X  paused: {}\n", appliedInterpolations + 1, overlayOff);
 				}
 				if (fps.empty() && real >= 1.0) fps = std::format("{:.0f}", real);
-				if (setting != appliedInterpolations && appliedInterpolations > 0)
+				if (fgLoaded && setting != appliedInterpolations && appliedInterpolations > 0)
 					fg += std::format("\t!set to {}X, this GPU allows {}X\n", setting + 1, maxInterpolations + 1);
-				if (!unlockApplied) fg += "\t!multi-frame unlock failed: " + unlockFailure + "\n";
+				if (fgLoaded && !unlockApplied) fg += "\t!multi-frame unlock failed: " + unlockFailure + "\n";
+				if (DiagNonDefault()) fg += "Diag\t" + DiagPanel() + "\n";
+				if (LatencyWanted() == Latency::AntiLag2 && latencyApplied != Latency::AntiLag2 && al2Tried)
+					fg += std::format("Latency\t!Anti-Lag 2 unavailable (0x{:08X}), XeLL\n", static_cast<std::uint32_t>(al2Hr));
+				else
+					fg += std::format("Latency\t{}{}\n", LatencyName(latencyApplied),
+						!asyncWanted ? "" : asyncActive ? ", async present" : ", async present paused (ReShade depth)");
 				if (lastGenResult != 0) fg += std::format("\t!last generation error {}\n", lastGenResult);
-				if (GetSettings().frameGenEngine != 1) fg += "\t!FSR-FG selected: restart to switch\n";
 				const std::string text = sr_status::Panel(fps, fg, seconds, overlaySr);
 				return std::array<std::string, 2>{ text, text };
 			};
@@ -1351,6 +1908,7 @@ namespace
 		HRESULT OnPresent(IDXGISwapChain* chain, UINT syncInterval, UINT flags)
 		{
 			if ((flags & DXGI_PRESENT_TEST) != 0) return g_origPresent(chain, syncInterval, flags);
+			if ((frameId % 120) == 1) ReadDiagnostics();
 			ui_redirect::End();
 			KeepWindowSize();
 			KeepEngineWindowSize("present");
@@ -1365,6 +1923,7 @@ namespace
 			Marker(id, XELL_RENDERSUBMIT_END);
 
 			const char* block = interop.Healthy() ? GenerationBlock() : "interop failed";
+			AsyncSelect();
 
 			bool presented = false;
 			ComPtr<ID3D11Texture2D> source;
@@ -1384,7 +1943,8 @@ namespace
 					DumpCentre(hudless.tex11.Get(), id, "hudless");
 					DumpCentre(back.tex11.Get(), id, "final");
 				}
-				const bool signalled = interop.SignalFromD3D11(ctx11.Get()) && interop.WaitOnD3D12();
+				const bool signalled = !asyncActive && interop.SignalFromD3D11(ctx11.Get()) && interop.WaitOnD3D12();
+				if (asyncActive) presented = AsyncSubmit(id, block);
 				SetStep(Step::BeginFrame, id);
 				auto* list = signalled ? interop.BeginFrame() : nullptr;
 				ComPtr<ID3D12Resource> target;
@@ -1418,32 +1978,43 @@ namespace
 			if (!presented && !block) block = "back buffer copy failed";
 
 			const bool fgFrame = presented && !block;
-			if (fgFrame != fgEnabled) {
+			// Under async present the worker owns fgEnabled, the interpolation
+			// count, the proxy Present and its XeLL present markers.
+			if (fg && !asyncActive && fgFrame != fgEnabled) {
 				api.setEnabled(fg, fgFrame ? 1u : 0u);
 				fgEnabled = fgFrame;
 			}
 			if (fgFrame) {
-				ApplyInterpolations();
+				if (!asyncActive) ApplyInterpolations(GetSettings().xefgInterpolations);
 				resetNext = false;
 			} else {
 				resetNext = true;
 				lastOff = block;
 			}
-			if (presented) {
-				api.setPresentId(fg, id);
+			if (presented && !asyncActive) {
+				if (fg) api.setPresentId(fg, id);
 				Marker(id, XELL_PRESENT_START);
 				xefg_pacing::NoteAppSubmit(id);
 				SetStep(Step::ProxyPresent, id);
+				const bool al2Fg = fgFrame && latencyApplied == Latency::AntiLag2;
+				if (al2Fg) AMD::AntiLag2DX12::MarkEndOfFrameRendering(&g_al2);
+				g_al2FrameTypes.store(al2Fg, std::memory_order_relaxed);
+				const auto presentStart = std::chrono::steady_clock::now();
 				const HRESULT hr12 = proxy->Present(1, 0);
+				const auto blockNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - presentStart).count();
+				if (fgFrame) xefg_pacing::NoteAppBlock(blockNs);
+				statBlockMs += blockNs / 1e6;
+				++statBlockCount;
 				Marker(id, XELL_PRESENT_END);
 				if (FAILED(hr12)) F4SE::log::warn("f4sr: XeFG proxy Present hr=0x{:08X}", static_cast<std::uint32_t>(hr12));
 				xefg_swapchain_present_status_t status{};
 				SetStep(Step::PresentStatus, id);
-				Stats(api.lastPresentStatus(fg, &status) == XEFG_SWAPCHAIN_RESULT_SUCCESS ? &status : nullptr, fgFrame);  // warnings mean no status
+				Stats(PresentStatus(status) ? &status : nullptr, fgFrame);  // warnings mean no status
 				// The next frame's D3D11 writes into the shared copies wait for this frame's D3D12 reads.
 				SetStep(Step::FenceOrder, id);
-				if (!interop.SignalFromD3D12() || !interop.WaitOnD3D11(ctx11.Get())) F4SE::log::error("f4sr: XeFG fence ordering failed");
-			} else {
+				if (!interop.SignalFromD3D12() || (diagFenceWait && !interop.WaitOnD3D11(ctx11.Get())))
+					F4SE::log::error("f4sr: XeFG fence ordering failed");
+			} else if (!presented) {
 				Marker(id, XELL_PRESENT_START);
 				Marker(id, XELL_PRESENT_END);
 				static std::uint64_t warned = 0;
@@ -1466,10 +2037,37 @@ namespace
 				logged = true;
 				F4SE::log::info("f4sr: XeFG: game swap chain Present is skipped (output goes through the proxy chain only)");
 			}
+			if (diagGamePresent) {
+				// Diagnostic: give the D3D11 driver its Present on the hidden game
+				// chain, below any wrapper, without ever blocking on it.
+				const Present_t present = (g_innerChain && chain == g_innerChain && g_innerOrigPresent) ? g_innerOrigPresent : g_origPresent;
+				const HRESULT gp = present(chain, 0, DXGI_PRESENT_DO_NOT_WAIT);
+				lastGamePresentHr = gp;
+				if (gp == DXGI_ERROR_WAS_STILL_DRAWING) ++statGamePresentBusy;
+				else if (FAILED(gp)) ++statGamePresentFailed;
+				else ++statGamePresentOk;
+			}
 
 			frameId = id + 1;
 			SetStep(Step::XellSleep, id);
-			if (xell) api.xellSleep(xell, frameId);
+			// iXeLLSleep other than 1 is a diagnostic override of the setting.
+			const bool diagSleep = ApplySleepMode(fgFrame);
+			const bool diagOverride = diagXellSleep != 1;
+			const Latency latency = xell ? ApplyLatency() : Latency::Off;
+			if (diagOverride ? diagSleep : latency == Latency::XeLL) {
+				g_xellResync.store(xellResyncNext, std::memory_order_relaxed);
+				api.xellSleep(xell, frameId);
+				g_xellResync.store(false, std::memory_order_relaxed);
+				xellResyncNext = false;
+			}
+			if (!diagOverride && latency == Latency::AntiLag2) {
+				const auto t0 = std::chrono::steady_clock::now();
+				AMD::AntiLag2DX12::Update(&g_al2, true, 0);
+				const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+				++statAl2Calls;
+				statAl2Ms += ms;
+				statAl2MaxMs = (std::max)(statAl2MaxMs, ms);
+			}
 			SetStep(Step::Idle, id);
 			const auto done = g_presentsDone.fetch_add(1) + 1;
 			g_lastPresentDone.store(GetTickCount64(), std::memory_order_relaxed);
@@ -1504,10 +2102,11 @@ namespace
 	constexpr auto kWaitForGameplay = "\tRender Resolution changes when the menu closes\n";
 	constexpr auto kRebuilding = "\tApplying the new Render Resolution\n";
 	constexpr auto kRestored = "\t!Render Resolution change failed; previous kept\n";
-	constexpr auto kRestartBlocked = "\t!New Render Resolution applies after a restart\n"
+	// Shown in the panel's restart section (sr_status::RestartRows).
+	constexpr auto kRestartBlocked = "\t^Render Resolution change\n"
 									 "\t(another mod blocks live resizing, e.g.\n"
 									 "\tHighFPSPhysicsFix ResizeBuffersDisable=true)\n";
-	constexpr auto kRestartRequired = "\t!New Render Resolution applies after a restart\n";
+	constexpr auto kRestartRequired = "\t^Render Resolution change\n";
 
 	RenderSize InnerBufferSize()
 	{
@@ -1651,6 +2250,7 @@ namespace
 			RefuseQualityChange("current engine targets do not match the swap chain");
 			return;
 		}
+		p.AsyncIdle();  // the present worker must not touch the proxy or the shared textures during the resize
 		if (p.fgEnabled) {
 			if (!Ok(p.api.setEnabled(p.fg, 0), "disable XeFG before Path B resize")) {
 				RefuseQualityChange("could not pause frame generation");
@@ -1999,6 +2599,12 @@ namespace f4sr::xefg
 	}
 
 	const char* PathBQualityNote() { return g_qualityNote.load(std::memory_order_relaxed); }
+	bool PathBQualityNeedsRestart()
+	{
+		const char* note = PathBQualityNote();
+		return note == kRestartBlocked || note == kRestartRequired;
+	}
+	bool GenerationNeedsRestart() { return g_presenter.attached ? !g_presenter.fgLoaded : !g_redirectInstalled; }
 
 	UINT OutputWidth() { return g_presenter.outWidth; }
 
@@ -2019,7 +2625,7 @@ namespace f4sr::xefg
 	{
 		auto& p = g_presenter;
 		p.hudlessReady = false;
-		if (!p.attached || !ctx || !frame || !p.hudless.tex11 || !GetSettings().enableFrameGeneration) return;
+		if (!p.attached || !p.fg || !ctx || !frame || !GetSettings().enableFrameGeneration || !p.EnsureHudless()) return;
 		ctx->CopyResource(p.hudless.tex11.Get(), frame);
 		p.hudlessReady = true;
 	}
@@ -2068,7 +2674,7 @@ namespace f4sr::xefg
 	{
 		auto& p = g_presenter;
 		p.hudlessReady = false;
-		if (!p.attached || !rtManager || !GetSettings().enableFrameGeneration) return;
+		if (!p.attached || !p.fg || !rtManager || !GetSettings().enableFrameGeneration || !p.EnsureHudless()) return;
 		auto* data = RE::BSGraphics::RendererData::GetSingleton();
 		if (!data || !data->context) return;
 		// Logical kFrameBuffer through the manager's rtID map (as FrameGen::CaptureHudless).
@@ -2112,14 +2718,20 @@ namespace f4sr::xefg
 			src->GetDesc(&d);
 			if (t.tex11 && t.desc.Width == d.Width && t.desc.Height == d.Height && t.desc.Format == d.Format) return true;
 			t = {};
-			return p.CreateTexture(t, d.Width, d.Height, d.Format);
+			if (!p.CreateTexture(t, d.Width, d.Height, d.Format)) return false;
+			vram_budget::Note(&t == &p.depth ? "XeFG depth input (frame generation on)" : "XeFG motion input (frame generation on)", d.Width, d.Height, d.Format);
+			return true;
 		};
-		if (!ensure(p.depth, in.depth) || !ensure(p.motion, in.motionVectors)) {
+		// Depth and motion copies feed generation only; with frame generation
+		// off they are neither created nor copied (ReShade's depth below is
+		// separate).
+		const bool generate = GetSettings().enableFrameGeneration && p.fg;
+		if (generate && (!ensure(p.depth, in.depth) || !ensure(p.motion, in.motionVectors))) {
 			F4SE::log::error("f4sr: XeFG depth/motion texture creation failed");
 			return;
 		}
 		const D3D11_BOX box{ 0, 0, 0, in.renderWidth, in.renderHeight, 1 };
-		ctx->CopySubresourceRegion(p.depth.tex11.Get(), 0, 0, 0, 0, in.depth, 0, &box);
+		if (generate) ctx->CopySubresourceRegion(p.depth.tex11.Get(), 0, 0, 0, 0, in.depth, 0, &box);
 		if (reshade_preui::WantsDepth()) {
 			// Exactly the rendered region: Classic's depth is display-size with
 			// the frame in its top-left corner, and ReShade samples 0..1 UV.
@@ -2136,6 +2748,7 @@ namespace f4sr::xefg
 			}
 			if (t.tex11) ctx->CopySubresourceRegion(t.tex11.Get(), 0, 0, 0, 0, in.depth, 0, &box);
 		}
+		if (!generate) return;
 		ctx->CopySubresourceRegion(p.motion.tex11.Get(), 0, 0, 0, 0, in.motionVectors, 0, &box);
 		p.inputs = in;
 		p.inputs.depth = p.inputs.motionVectors = nullptr;

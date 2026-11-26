@@ -55,6 +55,15 @@ namespace f4sr::xefg_pacing
 		bool burstPaced{};  // generated frames of the current burst were paced; its real frame follows
 		bool loggedFirst{};
 		std::atomic<std::int64_t> renderTimeNs{ 0 };
+		// Called before every provider present with whether it is a generated
+		// frame (Anti-Lag 2 frame type); null when unused.
+		std::atomic<void (*)(bool)> frameType{ nullptr };
+		// Time the game thread spends blocked in its proxy Present (moving
+		// average, game thread writes). Taken out of the period before the
+		// interval is derived, so a blocked game thread does not lengthen the
+		// interval that blocks it (CPU-bound feedback, 2026-11-25).
+		std::atomic<std::int64_t> appBlockNs{ 0 };
+		std::atomic<bool> blockComp{ false };  // experiment, off: 1-core A/B 2026-11-26 gained <=5 % fps and spaced frames less evenly
 		// Per-present trace windows.
 		// site 0 = the application's own Present of real frame `frame` on the
 		// proxy chain (game thread); other sites are provider presents.
@@ -121,16 +130,32 @@ namespace f4sr::xefg_pacing
 		if (g.periodNs > 0) {
 			const auto block = NsFromQpc(g.blockQpc);
 			g.renderTimeNs.store(g.periodNs > block ? g.periodNs - block : 0, std::memory_order_relaxed);
-			g.intervalQpc = QpcFromNs(g.periodNs * kHeadroomPct / 100 / (static_cast<std::int64_t>(count) + 1));
+			std::int64_t effective = g.periodNs;
+			if (g.blockComp.load(std::memory_order_relaxed))
+				effective = (std::max)(g.periodNs - g.appBlockNs.load(std::memory_order_relaxed), g.periodNs / 2);
+			g.intervalQpc = QpcFromNs(effective * kHeadroomPct / 100 / (static_cast<std::int64_t>(count) + 1));
 		}
 		g.blockQpc = 0;
 		g.lastBurst = now;
 	}
 
+	// Sleeps on a high-resolution waitable timer and spins only for the last
+	// 0.5 ms. The previous Sleep(0) loop kept the provider's present thread
+	// on a core for the whole wait; in CPU-bound scenes that time came out of
+	// the game's own threads (2026-11-25, one core: 2X real 26 -> 37 fps with
+	// pacing off). Falls back to that loop if the timer is unavailable.
 	inline void WaitUntil(std::int64_t target)
 	{
+		thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+		const auto spinBelow = QpcFromNs(500000);
+		auto now = Now();
+		if (timer && target - now > spinBelow) {
+			LARGE_INTEGER due{};
+			due.QuadPart = -static_cast<LONGLONG>(NsFromQpc(target - now - spinBelow) / 100);  // relative, 100 ns units
+			if (due.QuadPart < 0 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
+		}
 		const auto yieldBelow = QpcFromNs(200000);
-		for (auto now = Now(); now < target; now = Now()) {
+		for (now = Now(); now < target; now = Now()) {
 			if (target - now > yieldBelow) Sleep(0);
 			else YieldProcessor();
 		}
@@ -231,6 +256,13 @@ namespace f4sr::xefg_pacing
 
 	// Game thread: stamps the real frame's Present on the proxy chain into
 	// the same trace, as the anchor for the provider presents that follow.
+	// Game thread: duration of its proxy Present for one real frame.
+	inline void NoteAppBlock(std::int64_t ns)
+	{
+		const auto old = g.appBlockNs.load(std::memory_order_relaxed);
+		g.appBlockNs.store(old ? (old * 7 + ns) / 8 : ns, std::memory_order_relaxed);
+	}
+
 	inline void NoteAppSubmit(std::uint32_t frame)
 	{
 		if (g.installed) Trace(0, 0, 0, 0, frame);
@@ -268,6 +300,7 @@ namespace f4sr::xefg_pacing
 		if (ret == kOtherSiteD && g.enabled.load(std::memory_order_relaxed)) waited = PaceReal();
 		else if (!loop && !last) g.burstPaced = false;
 		Trace(ret, index, count, waited);
+		if (auto* type = g.frameType.load(std::memory_order_relaxed)) type(count > 0);
 		return g.native(ctx, a2, a3, a4, arg5, arg6, arg7);
 	}
 

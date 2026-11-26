@@ -17,6 +17,7 @@ target_include_directories(f4sr PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/sdk/FidelityFX-SDK/Kits/FidelityFX/upscalers/include"
 	"${CMAKE_CURRENT_SOURCE_DIR}/sdk/FidelityFX-SDK/Kits/FidelityFX/framegeneration/include"
 	"${CMAKE_CURRENT_SOURCE_DIR}/sdk/xess/inc"
+	"${CMAKE_CURRENT_SOURCE_DIR}/sdk/antilag2"
 	"${CMAKE_CURRENT_SOURCE_DIR}/sdk/reshade/include")
 target_link_libraries(f4sr PRIVATE CommonLibF4)
 target_precompile_headers(f4sr PRIVATE src/PCH.h)

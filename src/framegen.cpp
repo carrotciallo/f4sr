@@ -722,8 +722,7 @@ namespace f4sr
 				if (!GetSettings().enableFrameGeneration)
 					fg = "FrameGen\toff (MCM)\n";
 				else if (!xefg::RedirectInstalled())
-					fg = "FrameGen\t!XeSS-FG starts after a game restart\n"
-						 "\t(frame generation was off at launch)\n";
+					fg = "FrameGen\toff (XeSS-FG not loaded)\n";
 				else
 					fg = "FrameGen\t!XeSS-FG selected but not running\n"
 						 "\t(see 'XeFG' lines in f4sr.log)\n";

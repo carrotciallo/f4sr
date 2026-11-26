@@ -4,6 +4,7 @@
 // (ui_redirect) and the XeSS-FG proxy chain presents it.
 
 #include "frame_pipeline.h"
+#include "vram_budget.h"
 #include "frame_pipeline_detail.h"
 
 #include "settings.h"
@@ -104,6 +105,8 @@ namespace f4sr
 				F4SE::log::error("f4sr: ENB before upscaling: canvas {}x{} format {} creation failed", outW, outH, static_cast<unsigned>(d.Format));
 				return false;
 			}
+			vram_budget::Note("UI Native canvas", outW, outH, d.Format);
+			vram_budget::TrackTexture(canvas_.Get());
 			F4SE::log::info("f4sr: ENB before upscaling: canvas {}x{} format {} (frame buffer {}x{} format {})", outW, outH,
 				static_cast<unsigned>(d.Format), fb.Width, fb.Height, static_cast<unsigned>(fb.Format));
 		}
@@ -327,6 +330,8 @@ namespace f4sr
 				d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 				sceneOut_ = {};
 				interop_.CreateSharedTexture(d, sceneOut_);
+				vram_budget::Note("UI Native upscaler input", fb.Width, fb.Height, d.Format);
+				vram_budget::Note("UI Native upscaler output", outW, outH, d.Format);
 				if (!CreateUpscalerB(fb.Width, fb.Height, outW, outH, typed)) {
 					if (useXess_) {
 						pathBXessUnavailable_ = true;

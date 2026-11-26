@@ -17,6 +17,14 @@ namespace f4sr
 		// XeSS-FG generated frames per real frame: 1 = 2X, 2 = 3X, 3 = 4X.
 		// Above 1 needs the in-memory multi-frame unlock; otherwise clamped to 1.
 		int xefgInterpolations{ 1 };
+		// Low latency for the XeSS-FG presenter, live: 0 = off (XeLL low-latency
+		// mode stays on, xellSleep is not called), 1 = XeLL, 2 = AMD Anti-Lag 2
+		// on the interop D3D12 device (falls back to XeLL when unavailable).
+		int lowLatency{ 1 };
+		// XeSS-FG asynchronous presentation (MCM bXeFGAsyncPresent; plugin ini
+		// iXeFGAsyncPresent=1 before 1.1), startup-only: a worker thread does
+		// the proxy Present so the game thread does not wait out XeFG's pacing.
+		bool asyncPresent{ false };
 		bool frameGenOverlay{ false };
 		bool frameGenCapture{ false };
 		// FSR-FG diagnostic: how the generated frame is presented.
@@ -76,6 +84,10 @@ namespace f4sr
 	void LoadSettings();
 	// Read live MCM overrides without publishing the new settings.
 	Settings ReadMcmSettings();
+	// Compares the MCM's startup-only values (and frame generation when
+	// XeSS-FG was not loaded) with this session; lists what needs a restart
+	// in the status panel.
+	void UpdateRestartPending();
 	// The MCM file's last-write time (0 when missing).
 	std::uint64_t McmSettingsWriteTime();
 	// Writes one value into the MCM settings file ([Main]).

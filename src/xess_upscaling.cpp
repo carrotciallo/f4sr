@@ -1,6 +1,7 @@
 #include "sr_status.h"
 #include "xess_upscaling.h"
 #include "settings.h"
+#include "vram_budget.h"
 
 #include <windows.h>
 
@@ -15,6 +16,7 @@ namespace
 	using PFN_xessD3D12Execute = xess_result_t (*)(xess_context_handle_t, ID3D12GraphicsCommandList*, const xess_d3d12_execute_params_t*);
 	using PFN_xessSetVelocityScale = xess_result_t (*)(xess_context_handle_t, float, float);
 	using PFN_xessDestroyContext = xess_result_t (*)(xess_context_handle_t);
+	using PFN_xessGetProperties = xess_result_t (*)(xess_context_handle_t, const xess_2d_t*, xess_properties_t*);
 
 	struct XessApi
 	{
@@ -24,6 +26,7 @@ namespace
 		decltype(&xessGetOptimalInputResolution) inputRange{};
 		PFN_xessSetVelocityScale setVelocityScale{ nullptr };
 		PFN_xessDestroyContext destroyContext{ nullptr };
+		PFN_xessGetProperties getProperties{ nullptr };  // optional, VRAM log only
 	};
 
 	const XessApi* Api()
@@ -50,6 +53,7 @@ namespace
 			a->inputRange = reinterpret_cast<decltype(a->inputRange)>(GetProcAddress(module, "xessGetOptimalInputResolution"));
 			a->setVelocityScale = reinterpret_cast<PFN_xessSetVelocityScale>(GetProcAddress(module, "xessSetVelocityScale"));
 			a->destroyContext = reinterpret_cast<PFN_xessDestroyContext>(GetProcAddress(module, "xessDestroyContext"));
+			a->getProperties = reinterpret_cast<PFN_xessGetProperties>(GetProcAddress(module, "xessGetProperties"));
 			if (a->createContext == nullptr || a->init == nullptr || a->execute == nullptr ||
 				a->setVelocityScale == nullptr || a->destroyContext == nullptr) {
 				F4SE::log::error("f4sr: libxess.dll entry points missing");
@@ -140,9 +144,17 @@ namespace f4sr
 		responsiveMask_ = responsiveMask;
 		params.creationNodeMask = 1;
 		params.visibleNodeMask = 1;
+		const auto vramBefore = vram_budget::LocalUsage();
 		if (!Ok(api->init(context_, &params), "xessD3D12Init")) {
 			Destroy();
 			return false;
+		}
+		vram_budget::NoteDelta("XeSS-SR context", vramBefore);
+		if (vramBefore) sdkBytes_.Set(static_cast<std::int64_t>(vram_budget::LocalUsage()) - static_cast<std::int64_t>(vramBefore));
+		if (api->getProperties) {
+			xess_properties_t props{};
+			if (api->getProperties(context_, &output, &props) == XESS_RESULT_SUCCESS)
+				vram_budget::NoteBytes("XeSS-SR temporary heaps (buffers + textures, SDK-reported)", props.tempBufferHeapSize + props.tempTextureHeapSize);
 		}
 		if (pathBInput) {
 			F4SE::log::info("f4sr: Path B XeSS-SR: context created {}x{} -> {}x{} (MCM preset {}, XeSS quality {}, LDR)",
@@ -162,6 +174,7 @@ namespace f4sr
 			}
 			context_ = nullptr;
 		}
+		sdkBytes_.Set(0);
 	}
 
 	bool XessUpscaler::Dispatch(ID3D12GraphicsCommandList* cmdList, const UpscaleFrame& frame)

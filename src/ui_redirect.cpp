@@ -1,4 +1,5 @@
 #include "ui_redirect.h"
+#include "vram_budget.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -188,6 +189,8 @@ namespace
 		}
 		u.game = tex.Get();
 		g.ui.push_back(std::move(u));
+		f4sr::vram_budget::Note("UI twin (display-size copy of a UI target)", t.Width, t.Height, t.Format);
+		f4sr::vram_budget::TrackTexture(g.ui.back().twin.Get());
 		const int kind = static_cast<int>(1 + g.ui.size());
 		if (auto* v = UiRtv(kind, g.gameRtv[0].Get())) {
 			const FLOAT zero[4]{};
@@ -249,6 +252,8 @@ namespace
 				return nullptr;
 			}
 			g.depthTextures.emplace_back(tex.Get(), twin);
+			f4sr::vram_budget::Note("UI depth twin", d.Width, d.Height, d.Format);
+			f4sr::vram_budget::TrackTexture(twin.Get());
 		}
 		D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
 		game->GetDesc(&dd);

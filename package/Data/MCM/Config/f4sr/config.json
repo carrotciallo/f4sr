@@ -88,7 +88,7 @@
       "id": "bEnableFrameGeneration:Main",
       "type": "switcher",
       "text": "Frame Generation",
-      "help": "Smoother motion, a little more latency. Needs upscaling. Classic + XeSS-FG: turning it on needs a restart.",
+      "help": "Smoother motion, a little more latency. Needs upscaling. If the game started with it off, turning it on needs a restart (XeSS-FG is not loaded then, which saves VRAM).",
       "valueOptions": {
         "sourceType": "ModSettingBool"
       }
@@ -119,6 +119,31 @@
           "3X",
           "4X"
         ]
+      },
+      "groupCondition": 2
+    },
+    {
+      "id": "iLowLatency:Main",
+      "type": "dropdown",
+      "text": "Low Latency",
+      "help": "XeLL: default. Anti-Lag 2: AMD only, also works with frame generation off; falls back to XeLL if unavailable. Off: no latency control. Applies live.",
+      "valueOptions": {
+        "sourceType": "ModSettingInt",
+        "options": [
+          "Off",
+          "XeLL",
+          "Anti-Lag 2 (AMD)"
+        ]
+      },
+      "groupCondition": 2
+    },
+    {
+      "id": "bXeFGAsyncPresent:Main",
+      "type": "switcher",
+      "text": "Async Present",
+      "help": "XeSS-FG presents on a worker thread, so the game does not wait for frame pacing. Try it if the GPU clocks down or GPU usage stays low with frame generation on (seen on AMD RX 9000). Off by default. Needs a restart.",
+      "valueOptions": {
+        "sourceType": "ModSettingBool"
       },
       "groupCondition": 2
     },

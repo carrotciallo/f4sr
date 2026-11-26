@@ -21,14 +21,14 @@ namespace f4sr
 
 		struct Row
 		{
-			bool title{}, warn{}, gap{};
+			bool title{}, warn{}, restart{}, gap{};
 			std::string label, value;
 		};
 
 		// Panel text format: one row per line. A line starting with '#' is the
 		// title; otherwise "label<TAB>value" (label may be empty for a
-		// continuation row). A value starting with '!' is a warning; an empty
-		// line is a small gap.
+		// continuation row). A value starting with '!' is a warning, '^' a
+		// setting that waits for a restart; an empty line is a small gap.
 		std::vector<Row> Parse(const std::string& text)
 		{
 			std::vector<Row> rows;
@@ -47,8 +47,8 @@ namespace f4sr
 					const size_t tab = line.find('\t');
 					r.label = tab == std::string::npos ? std::string() : line.substr(0, tab);
 					r.value = tab == std::string::npos ? line : line.substr(tab + 1);
-					if (!r.value.empty() && r.value[0] == '!') {
-						r.warn = true;
+					if (!r.value.empty() && (r.value[0] == '!' || r.value[0] == '^')) {
+						(r.value[0] == '!' ? r.warn : r.restart) = true;
 						r.value.erase(0, 1);
 					}
 				}
@@ -194,7 +194,7 @@ float4 ps(V i) : SV_Target
 			const int h = std::clamp(height, 60, static_cast<int>(kMaxH));
 
 			const COLORREF accent = i ? RGB(255, 120, 210) : RGB(90, 225, 150);
-			const COLORREF label = RGB(135, 150, 178), value = RGB(232, 236, 242), warn = RGB(255, 176, 80);
+			const COLORREF label = RGB(135, 150, 178), value = RGB(232, 236, 242), warn = RGB(255, 176, 80), restartColor = RGB(255, 105, 105);
 			std::fill_n(static_cast<std::uint32_t*>(bits), kMaxW * kMaxH, bgBits);
 			int y = kPadTop;
 			for (const auto& r : rows) {
@@ -215,7 +215,7 @@ float4 ps(V i) : SV_Target
 				}
 				SetTextColor(dc, label);
 				TextOutA(dc, kPadX, y, r.label.c_str(), static_cast<int>(r.label.size()));
-				SetTextColor(dc, r.warn ? warn : value);
+				SetTextColor(dc, r.restart ? restartColor : r.warn ? warn : value);
 				TextOutA(dc, valueX, y, r.value.c_str(), static_cast<int>(r.value.size()));
 				y += kLine;
 			}

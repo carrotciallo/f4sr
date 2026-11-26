@@ -12,10 +12,12 @@
 
 #include "settings.h"
 #include "version.h"
+#include "vram_budget.h"
 
 namespace f4sr::xefg
 {
 	const char* PathBQualityNote();
+	bool PathBQualityNeedsRestart();
 	bool OutputScaling();
 }
 namespace f4sr::reshade_preui { std::string PanelLine(); }
@@ -48,6 +50,9 @@ namespace f4sr::sr_status
 		std::atomic<std::int64_t> lastRaised{};
 	};
 	inline Alerts alerts;
+	// Restart rows force the panel only while there are any (see SetRestartLines).
+	inline std::atomic<std::int64_t> restartRaised{};
+	inline std::atomic<bool> restartListed{};
 	inline constexpr std::int64_t kAlertMs = 30'000;
 
 	inline std::int64_t NowMs()
@@ -73,8 +78,11 @@ namespace f4sr::sr_status
 	}
 	inline bool PanelForced()
 	{
+		const auto now = NowMs();
 		const auto t = alerts.lastRaised.load(std::memory_order_relaxed);
-		return t != 0 && NowMs() - t < kAlertMs;
+		if (t != 0 && now - t < kAlertMs) return true;
+		const auto r = restartRaised.load(std::memory_order_relaxed);
+		return r != 0 && now - r < kAlertMs && restartListed.load(std::memory_order_relaxed);
 	}
 	// `panelSetting`: the Status Panel option, to say why the panel appeared.
 	inline std::string AlertLines(bool panelSetting)
@@ -86,6 +94,50 @@ namespace f4sr::sr_status
 		}
 		if (!panelSetting && PanelForced()) out += "\t(this panel closes in 30 s; details in f4sr.log)\n";
 		return out;
+	}
+
+	// Settings changed in the MCM that apply only after a game restart: rows
+	// "\t^<what>\n" (UpdateRestartPending). A new row forces the panel on
+	// like an alert; the list stays in the panel until the restart.
+	struct Restart
+	{
+		std::mutex m;
+		std::string lines;
+	};
+	inline Restart restart;
+
+	inline void SetRestartLines(std::string lines)
+	{
+		bool added = false;
+		{
+			std::lock_guard lock(restart.m);
+			if (lines == restart.lines) return;
+			for (size_t start = 0; start < lines.size();) {
+				const size_t end = lines.find('\n', start);
+				const std::string row = lines.substr(start, end - start + 1);
+				if (restart.lines.find(row) == std::string::npos) added = true;
+				start = end == std::string::npos ? lines.size() : end + 1;
+			}
+			restart.lines = std::move(lines);
+			restartListed.store(!restart.lines.empty(), std::memory_order_relaxed);
+		}
+		// Changed back: the forced panel goes at once instead of after 30 s.
+		if (added) restartRaised.store(NowMs(), std::memory_order_relaxed);
+	}
+
+	// The restart section: MCM changes plus a Render Resolution change that
+	// could not be applied live. Empty when nothing waits for a restart.
+	inline std::string RestartRows()
+	{
+		std::string rows;
+		{
+			std::lock_guard lock(restart.m);
+			rows = restart.lines;
+		}
+		if (xefg::PathBQualityNeedsRestart()) rows += xefg::PathBQualityNote();
+		if (rows.empty()) return rows;
+		rows.replace(0, 1, "Restart\t");  // label the first row
+		return rows + "\t(applies after a game restart)\n";
 	}
 
 	inline constexpr const char* kAlertSrStart = "Error\t!upscaler failed to start; upscaling is off\n";
@@ -120,7 +172,7 @@ namespace f4sr::sr_status
 	// last rebuild.
 	inline std::string UpscaleRows(bool enabled, double rate, bool sampled)
 	{
-		const char* pathBNote = xefg::PathBQualityNote();
+		const char* pathBNote = xefg::PathBQualityNeedsRestart() ? nullptr : xefg::PathBQualityNote();
 		if (!enabled) return std::string("Upscale\toff (MCM)\n") + (pathBNote ? pathBNote : "");
 		static constexpr const char* kQuality[]{ "Native AA", "Quality", "Balanced", "Performance" };
 		const int q = g.quality.load(std::memory_order_relaxed);
@@ -141,8 +193,8 @@ namespace f4sr::sr_status
 	}
 
 	// The whole status panel, shared by every frame-generation path:
-	//   title (version, pipeline), errors, FPS, upscaler, frame generation,
-	//   ReShade.
+	//   title (version, pipeline), errors, restart needed, FPS, upscaler,
+	//   frame generation, ReShade, VRAM.
 	// `fps` is the FPS value ("" = the upscaler's run rate), `frameGen` the
 	// caller's "FrameGen" rows, `titleSuffix` an optional title addition.
 	// `previous` is the caller's dispatch count at its last rebuild, `seconds`
@@ -156,11 +208,13 @@ namespace f4sr::sr_status
 		const bool enabled = GetSettings().enableUpscaling;
 		std::string out = std::format("{}   {}{}\n", version::kPanelTitle, xefg::OutputScaling() ? "UI Native" : "Classic", titleSuffix);
 		out += AlertLines(GetSettings().frameGenOverlay);
+		out += RestartRows();
 		if (!fps.empty()) out += "FPS\t" + fps + "\n";
 		else if (enabled && seconds > 0 && rate >= 1.0) out += std::format("FPS\t{:.0f}\n", rate);
 		out += UpscaleRows(enabled, rate, seconds > 0);
 		out += frameGen;
 		out += reshade_preui::PanelLine();
+		out += vram_budget::PanelLine();
 		return out;
 	}
 }

@@ -8,6 +8,7 @@
 #include "late_draw_trace.h"
 #include "proxy_targets.h"
 #include "settings.h"
+#include "vram_budget.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -63,6 +64,11 @@ namespace
 		auto& pipe = f4sr::Pipeline();
 		f4sr::gpu_timing::MarkAt(GameContext(), f4sr::gpu_timing::kFrameStart);
 		f4sr::dynres_audit::OnFrameStart();
+		if (auto* ctx = GameContext()) {
+			Microsoft::WRL::ComPtr<ID3D11Device> device;
+			ctx->GetDevice(&device);
+			f4sr::vram_budget::Tick(device.Get());
+		}
 		pipe.BeginTemporalData();  // the native update may query TAA before advancing frameCount
 		// Enable the producer only during its update. Never leave a forced
 		// user setting behind if SR fails, is disabled, or a menu intervenes.

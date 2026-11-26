@@ -149,11 +149,14 @@ namespace
 		wchar_t system[MAX_PATH]{};
 		GetSystemDirectoryW(system, MAX_PATH);
 		const HMODULE dxgi = LoadLibraryW((std::wstring(system) + L"\\dxgi.dll").c_str());
+		const DWORD loadError = dxgi ? 0 : GetLastError();
 		using CreateFactory_t = HRESULT(WINAPI*)(REFIID, void**);
 		auto* create = dxgi ? reinterpret_cast<CreateFactory_t>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
 		ComPtr<IDXGIFactory1> factory;
-		if (!create || FAILED(create(IID_PPV_ARGS(&factory)))) {
-			F4SE::log::info("f4sr: env: GPU: DXGI factory unavailable");
+		const HRESULT hr = create ? create(IID_PPV_ARGS(&factory)) : E_NOINTERFACE;
+		if (FAILED(hr) || !factory) {
+			F4SE::log::info("f4sr: env: GPU: DXGI factory unavailable (dxgi.dll {}, CreateDXGIFactory1 {}, hr 0x{:08X})",
+				dxgi ? "loaded" : std::format("load error {}", loadError), create ? "found" : "missing", static_cast<std::uint32_t>(hr));
 			return;
 		}
 		for (UINT i = 0;; ++i) {

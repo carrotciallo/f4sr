@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "F4SE/F4SE.h"
+#include "vram_budget.h"
 #include "interop.h"
 
 namespace f4sr
@@ -36,6 +37,7 @@ namespace f4sr
 			d.Format = mainDesc.Format;
 			d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 			if (FAILED(device->CreateTexture2D(&d, nullptr, opaque_.GetAddressOf()))) return Fail("opaque copy texture");
+			vram_budget::TrackTexture(opaque_.Get());
 			D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
 			sd.Format = Typed(mainDesc.Format);
 			sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;

@@ -1,5 +1,6 @@
 #include "sr_status.h"
 #include "frame_pipeline.h"
+#include "vram_budget.h"
 #include "frame_pipeline_detail.h"
 #include "capture.h"
 #include "frame_camera.h"
@@ -123,9 +124,14 @@ void main(uint3 id : SV_DispatchThreadID)
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 
+		// UI Native upscales the post-ENB frame (ldrShared_ -> sceneOut_), so
+		// the seam's upscale output is never written there; the seam colour
+		// copy only feeds the reactive mask, which UI Native XeSS does not use.
+		const bool pathB = xefg::OutputScaling();
+		const bool seamColor = !(pathB && GetSettings().backend == 2);
 		desc.Format = mainDesc.Format;
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		interop_.CreateSharedTexture(desc, colorShared_);
+		if (seamColor) interop_.CreateSharedTexture(desc, colorShared_);
 		if (colorShared_.tex11) {
 			D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
 			sd.Format = ReactiveMask::Typed(mainDesc.Format);
@@ -139,7 +145,7 @@ void main(uint3 id : SV_DispatchThreadID)
 		// ALLOW_UNORDERED_ACCESS and FidelityFX rejects every dispatch
 		// with ERROR_PARAMETER (2026-11-15 acceptance run).
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-		interop_.CreateSharedTexture(desc, outputShared_);
+		if (!pathB) interop_.CreateSharedTexture(desc, outputShared_);
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
 		desc.Format = mvDesc.Format;
@@ -200,18 +206,22 @@ bool FramePipeline::Init(ID3D11Device* device)
 		}
 		// Past the waiting gates: a false return from here on is a failure.
 		initAttempted_ = true;
+		vram_budget::Init(device);
+		const auto vramDevice = vram_budget::LocalUsage();
 		if (!interop_.Create(device)) {
 			return false;
 		}
+		vram_budget::NoteDelta("pipeline D3D12 interop device", vramDevice);
 		CreateStaging(device, mainTex, mvTex);
-		if (!colorShared_.res12 || !depthShared_.res12 || !mvShared_.res12 || !outputShared_.res12 || !depthUav_) {
+		const bool pathB = xefg::OutputScaling();
+		const bool seamColor = !(pathB && GetSettings().backend == 2);
+		if ((seamColor && !colorShared_.res12) || !depthShared_.res12 || !mvShared_.res12 || (!pathB && !outputShared_.res12) || !depthUav_) {
 			F4SE::log::error("f4sr: staging texture creation incomplete");
 			return false;
 		}
 		if (!CompileDepthShader(device)) {
 			return false;
 		}
-		const bool pathB = xefg::OutputScaling();
 		useXess_ = GetSettings().backend == 2;
 		if (useXess_) {
 			// Path B initializes XeSS at the actual pre-UI input/output pair.
@@ -219,8 +229,10 @@ bool FramePipeline::Init(ID3D11Device* device)
 			if (!pathB && !xessUpscaler_.Create(interop_.Device12(), mainDesc.Width, mainDesc.Height, GetSettings().qualityMode, reactive_.Ready())) {
 				return false;
 			}
-		} else if (!upscaler_.Create(interop_.Device12(), mainDesc.Width, mainDesc.Height,
+		} else if (!pathB && !upscaler_.Create(interop_.Device12(), mainDesc.Width, mainDesc.Height,
 				mainDesc.Width, mainDesc.Height, GetSettings().backend, GetSettings().debugView)) {
+			// UI Native upscales before the UI with upscalerB_ (CreateUpscalerB)
+			// and never dispatches the seam context, so it is not created there.
 			return false;
 		}
 		if (auto* chain = reinterpret_cast<IDXGISwapChain*>(data->renderWindow[0].swapChain); chain != nullptr) {
@@ -605,6 +617,7 @@ bool FramePipeline::Init(ID3D11Device* device)
 		const int requestedQuality = s.qualityMode;
 		if (xefg::OutputScaling()) s.qualityMode = previous.qualityMode;
 		GetSettings() = s;
+		UpdateRestartPending();
 		// A changed context setting deserves a fresh set of init attempts.
 		if (s.backend != previous.backend || s.qualityMode != previous.qualityMode ||
 			s.debugView != previous.debugView || s.enableFrameGeneration != previous.enableFrameGeneration ||
@@ -774,6 +787,14 @@ bool FramePipeline::Init(ID3D11Device* device)
 			return;
 		}
 		UpscaleFrame frame{};
+		if (!outputShared_.tex11 || !(useXess_ ? xessUpscaler_.Created() : upscaler_.Created())) {
+			// Built for UI Native (no seam output or seam context) but the
+			// presenter no longer scales the output: not expected in a session.
+			static bool logged = false;
+			if (!std::exchange(logged, true))
+				F4SE::log::error("f4sr: seam upscale skipped: the pipeline was built for the UI Native pipeline; restart the game");
+			return;
+		}
 		if (!DispatchUpscale(ctx, settings, displayW, displayH, mainTex, reactiveMask, frame)) return;
 
 		Writeback(ctx, data, settings, mainTex,
@@ -924,12 +945,12 @@ bool FramePipeline::Init(ID3D11Device* device)
 		// top-left render rectangle of these display-size inputs, so only
 		// that rectangle is copied (a quarter of the traffic at half scale).
 		const D3D11_BOX renderBox{ 0, 0, 0, renderW_, renderH_, 1 };
-		ctx->CopySubresourceRegion(colorShared_.tex11.Get(), 0, 0, 0, 0, mainTex, 0, &renderBox);
+		if (colorShared_.tex11) ctx->CopySubresourceRegion(colorShared_.tex11.Get(), 0, 0, 0, 0, mainTex, 0, &renderBox);
 		ctx->CopySubresourceRegion(mvShared_.tex11.Get(), 0, 0, 0, 0, mvTex, 0, &renderBox);
 		ID3D12Resource* reactiveMask = settings.reactiveMask ?
 			reactive_.Generate(ctx, colorSrv_.Get(), renderW_, renderH_, settings.reactiveScale) : nullptr;
 		static std::uint32_t captures = 0;  // Path B never advances resolveCount_
-		if (captures++ % 600 == 0 && settings.reactiveMask)
+		if (captures++ % 600 == 0 && settings.reactiveMask && colorShared_.tex11)
 			F4SE::log::info("f4sr: reactive mask {} (generated {}, no opaque snapshot {}, snapshots {})",
 				reactive_.Ready() ? "on" : "unavailable", reactive_.Generated(), reactive_.Missed(), reactive_.Snapshots());
 		sr_status::g.reactive.store(reactiveMask != nullptr, std::memory_order_relaxed);

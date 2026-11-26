@@ -11,6 +11,8 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include "vram_budget.h"
+
 namespace f4sr::output_scale
 {
 	inline DXGI_FORMAT ViewFormat(DXGI_FORMAT f)
@@ -28,10 +30,25 @@ namespace f4sr::output_scale
 		}
 	}
 
+	inline bool IsTypeless(DXGI_FORMAT f)
+	{
+		switch (f) {
+		case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+		case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+		case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+		case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+		case DXGI_FORMAT_R16G16B16A16_TYPELESS: return true;
+		default: return false;
+		}
+	}
+
 	// Bilinear copy of a texture into a larger (or equal) one. Runs in its own
 	// device context state, so the engine's and ENB's state caches never see
-	// a change. Source textures are copied into a shader-readable stage first
-	// (swap chain buffers are not always created with shader-resource binding).
+	// a change. A source the shader can read in place (shader-resource
+	// binding, not the destination, a raw view format) is read directly;
+	// others are copied into a shader-readable stage first (swap chain buffers
+	// are not always created with shader-resource binding). The stage costs a
+	// full copy of the source in VRAM (66 MB for a 4K RGBA16F source).
 	class Scaler
 	{
 	public:
@@ -63,6 +80,7 @@ namespace f4sr::output_scale
 					return false;
 				}
 				beforeDesc_ = d;
+				vram_budget::TrackTexture(before_.Get());
 			}
 			ctx->CopyResource(before_.Get(), src);
 			return true;
@@ -98,7 +116,7 @@ namespace f4sr::output_scale
 			if (FAILED(ctx->QueryInterface(IID_PPV_ARGS(&ctx1)))) return Fail();
 			Microsoft::WRL::ComPtr<ID3D11Device> device;
 			ctx->GetDevice(&device);
-			if (!device || !Init(device.Get()) || !Stage(device.Get(), src) || !Target(device.Get(), dst)) return false;
+			if (!device || !Init(device.Get()) || !Stage(device.Get(), src, dst) || !Target(device.Get(), dst)) return false;
 			if (base && (stageDesc_.Width != beforeDesc_.Width || stageDesc_.Height != beforeDesc_.Height ||
 				stageDesc_.Format != beforeDesc_.Format || !Base(device.Get(), base))) return false;
 			ID3D11PixelShader* shader = base ? psDelta_.Get() : changedOnly ? psChanged_.Get() : ps_.Get();
@@ -115,7 +133,7 @@ namespace f4sr::output_scale
 				shader = psTransfer.Get();
 			}
 
-			ctx->CopyResource(stage_.Get(), src);
+			if (!direct_) ctx->CopyResource(stage_.Get(), src);
 			Microsoft::WRL::ComPtr<ID3DDeviceContextState> previous;
 			ctx1->SwapDeviceContextState(state_.Get(), &previous);
 			const D3D11_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(dstDesc_.Width), static_cast<float>(dstDesc_.Height), 0.0f, 1.0f };
@@ -236,10 +254,34 @@ float4 psDelta(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 			return true;
 		}
 
-		bool Stage(ID3D11Device* device, ID3D11Texture2D* src)
+		bool Stage(ID3D11Device* device, ID3D11Texture2D* src, ID3D11Texture2D* dst)
 		{
 			D3D11_TEXTURE2D_DESC d{};
 			src->GetDesc(&d);
+			const bool readable = src != dst && (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 && d.SampleDesc.Count == 1 &&
+				d.ArraySize == 1 && (ViewFormat(d.Format) == d.Format || IsTypeless(d.Format));
+			if (readable) {
+				// srv_ holds a reference to src, so the pointer cannot be reused
+				// by another texture while it is cached.
+				if (direct_ == src && srv_) return true;
+				stage_.Reset();
+				srv_.Reset();
+				D3D11_SHADER_RESOURCE_VIEW_DESC v{};
+				v.Format = ViewFormat(d.Format);
+				v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				v.Texture2D.MipLevels = 1;
+				if (FAILED(device->CreateShaderResourceView(src, &v, &srv_))) {
+					direct_ = nullptr;
+					return Fail();
+				}
+				direct_ = src;
+				stageDesc_ = d;
+				return true;
+			}
+			if (direct_) {
+				direct_ = nullptr;
+				srv_.Reset();
+			}
 			if (stage_ && d.Width == stageDesc_.Width && d.Height == stageDesc_.Height && d.Format == stageDesc_.Format) return true;
 			stage_.Reset();
 			srv_.Reset();
@@ -256,6 +298,8 @@ float4 psDelta(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 			v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 			v.Texture2D.MipLevels = 1;
 			if (FAILED(device->CreateTexture2D(&s, nullptr, &stage_)) || FAILED(device->CreateShaderResourceView(stage_.Get(), &v, &srv_))) return Fail();
+			if (d.Width * d.Height >= 1920u * 1080u) vram_budget::Note("scaler stage copy", d.Width, d.Height, s.Format);
+			vram_budget::TrackTexture(stage_.Get());
 			stageDesc_ = d;
 			return true;
 		}
@@ -286,6 +330,7 @@ float4 psDelta(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 		Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_;
 		Microsoft::WRL::ComPtr<ID3DDeviceContextState> state_;
 		Microsoft::WRL::ComPtr<ID3D11Texture2D> stage_;
+		ID3D11Texture2D* direct_{};  // read in place; referenced by srv_
 		Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv_;
 		Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv_;
 		ID3D11Texture2D* target_{};  // the presenter owns it

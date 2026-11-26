@@ -51,7 +51,19 @@ namespace f4sr
 		bool SignalFromD3D11(ID3D11DeviceContext* ctx11);
 		bool WaitOnD3D12();
 
+		// Asynchronous presentation (iXeFGAsyncPresent): one more shared fence
+		// per direction, signalled with caller-chosen values (the frame
+		// sequence), so the game thread and the present thread never share a
+		// counter. "Ready": D3D11 finished writing a hand-off slot. "Retired":
+		// D3D12 (including the XeFG Present) finished reading it.
+		bool CreateAsyncFences();
+		bool SignalReadyFromD3D11(ID3D11DeviceContext* ctx11, std::uint64_t value);
+		bool WaitReadyOnD3D12(std::uint64_t value);
+		bool SignalRetiredFromD3D12(std::uint64_t value);
+		bool WaitRetiredOnD3D11(ID3D11DeviceContext* ctx11, std::uint64_t value);
+
 	private:
+		bool CreateSharedFence(Microsoft::WRL::ComPtr<ID3D12Fence>& fence12, Microsoft::WRL::ComPtr<ID3D11Fence>& fence11, const char* what);
 		bool Check(HRESULT hr, const char* operation);
 		bool WaitForCompletion(std::uint64_t value);
 		Microsoft::WRL::ComPtr<ID3D12Fence> completionFence_;
@@ -68,6 +80,8 @@ namespace f4sr
 		Microsoft::WRL::ComPtr<ID3D12Fence> fence12_;
 		Microsoft::WRL::ComPtr<ID3D11Fence> fence11_;
 		std::uint64_t fenceValue_{ 0 };
+		Microsoft::WRL::ComPtr<ID3D12Fence> ready12_, retired12_;
+		Microsoft::WRL::ComPtr<ID3D11Fence> ready11_, retired11_;
 		std::uint32_t frameIndex_{ 0 };
 	};
 }

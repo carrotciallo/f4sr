@@ -3,6 +3,7 @@
 
 #include "F4SE/F4SE.h"
 #include "ffx_runtime.h"
+#include "vram_budget.h"
 #include "settings.h"
 
 #include <dx12/ffx_api_dx12.h>
@@ -68,6 +69,7 @@ namespace f4sr
 			desc.header.pNext = &versionDesc.header;
 		}
 
+		const auto vramBefore = vram_budget::LocalUsage();
 		const auto rc = Ffx().CreateContext(&context_, &desc.header, nullptr);
 		if (rc != FFX_API_RETURN_OK) {
 			F4SE::log::error("f4sr: ffxCreateContext (upscale) failed: {}", static_cast<std::uint32_t>(rc));
@@ -88,6 +90,18 @@ namespace f4sr
 			if (Ffx().Query(&context_, &rr.header) == FFX_API_RETURN_OK) {
 				F4SE::log::info("f4sr: resource requirements: required={} optional={}", rr.required_resources, rr.optional_resources);
 			}
+			vram_budget::NoteDelta("FSR context", vramBefore);
+			FfxApiEffectMemoryUsage usage{};
+			ffxQueryDescUpscaleGetGPUMemoryUsage mu{};
+			mu.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
+			mu.gpuMemoryUsageUpscaler = &usage;
+			const bool reported = Ffx().Query(&context_, &mu.header) == FFX_API_RETURN_OK;
+			sdkBytes_.Set(reported ? static_cast<std::int64_t>(usage.totalUsageInBytes)
+								   : static_cast<std::int64_t>(vram_budget::LocalUsage()) - static_cast<std::int64_t>(vramBefore));
+			if (reported)
+				F4SE::log::info("f4sr: VRAM: FSR context {}x{} -> {}x{} ~{:.1f} MB (provider-reported, aliasable {:.1f} MB)", maxRenderWidth, maxRenderHeight,
+					maxOutputWidth, maxOutputHeight, static_cast<double>(usage.totalUsageInBytes) / vram_budget::kMb,
+					static_cast<double>(usage.aliasableUsageInBytes) / vram_budget::kMb);
 		}
 		return true;
 	}
@@ -98,6 +112,7 @@ namespace f4sr
 			Ffx().DestroyContext(&context_, nullptr);
 			context_ = nullptr;
 		}
+		sdkBytes_.Set(0);
 	}
 
 	bool FfxUpscaler::Dispatch(ID3D12GraphicsCommandList* cmdList, const UpscaleFrame& frame, float sharpness, bool debugView)

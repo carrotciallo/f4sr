@@ -50,12 +50,14 @@ The MCM page covers everything most players need:
 | Render Resolution | Native (AA only), Quality (67%), Balanced (59%), Performance (50%). Default: Balanced. In UI Native, return to gameplay to apply the preset; unsupported setups require a restart. |
 | Sharpening | FSR's RCAS sharpening. Keep it low if ENB already sharpens. |
 | Transparency Mask | Reactive mask for transparent effects. Recommended on. Needs a restart. |
-| Frame Generation | Master switch. Best on a variable-refresh (FreeSync / G-Sync) display. With XeSS-FG, turning it on the first time takes effect after a game restart; after that it switches live. |
+| Frame Generation | Master switch. Best on a variable-refresh (FreeSync / G-Sync) display. With XeSS-FG, XeSS-FG loads only if frame generation is on at launch: turning it on in a game that started with it off takes effect after a restart; after that it switches live. |
 | Frame Generation Engine | XeSS-FG (default) or FSR-FG. Needs a restart. See [Choosing a frame-generation engine](#choosing-a-frame-generation-engine). |
 | XeSS-FG Multiplier | 2X (default) / 3X / 4X. Shown only when XeSS-FG is selected. |
+| Low Latency | XeLL (default), AMD Anti-Lag 2 (AMD only, also works with frame generation off; falls back to XeLL when unavailable) or off. Applies live. |
+| Async Present | XeSS-FG presents on a worker thread, so the game does not wait for frame pacing. Try it if the GPU clocks down or GPU usage stays low with frame generation on (seen on AMD RX 9000). Off by default. Needs a restart. |
 | ReShade Effects Before UI | Renders ReShade effects under the HUD instead of on top of it. In UI Native they run together with ENB, before upscaling. See [ReShade notes](#reshade-notes). |
 | ReShade Depth | Gives ReShade the game's depth under XeSS-FG, and in Classic below Native, for ambient occlusion, depth of field, fog and similar effects. On by default. Applies live. |
-| Status Panel | Small top-left panel: version and pipeline, FPS (real → shown with frame generation), upscaler and preset, render → output size with the upscaler's GPU time, frame generation, and ReShade mode. Errors are listed at the top in orange; the panel also appears on its own for 30 seconds when an error turns a feature off. |
+| Status Panel | Small top-left panel: version and pipeline, FPS (real → shown with frame generation), upscaler and preset, render → output size with the upscaler's GPU time, frame generation, and ReShade mode. Errors are listed at the top in orange; settings changed in MCM that wait for a restart are listed in red under "Restart". The panel also appears on its own for 30 seconds when an error turns a feature off or a change needs a restart. The VRAM row shows the game's video memory use, F4SR's share, and the budget Windows gives the game. |
 | Log System Info | On by default. Writes a short system summary at the top of `f4sr.log` for bug reports (see [Log file and privacy](#log-file-and-privacy)). Applies at the next start. |
 
 Precedence: values saved by MCM (`Data/MCM/Settings/f4sr.ini`) override `Data/F4SE/Plugins/f4sr.ini`. The plugin ini also holds a few advanced and troubleshooting keys, and each one is documented in the file.
@@ -69,7 +71,7 @@ XeSS-FG is the default and the recommended engine. Compared with FSR-FG it gives
 - **A cleaner image** with less ghosting around moving objects, thin detail and transparencies.
 - **2X to 4X.** FSR-FG is 2X only.
 
-With the UI Native pipeline (the default), XeSS-FG takes over the game's swap chain even with frame generation off, so frame generation switches live. With Classic, XeSS-FG takes over the swap chain only if frame generation is on at launch; if you turn it on in a running game, restart once.
+XeSS-FG loads only if frame generation is on at launch. A game started with frame generation off does not load it, which saves about 1 GB of VRAM at 4K output; turning frame generation on then needs one restart. Once loaded, frame generation and its multiplier switch live. This holds for both pipelines.
 
 FSR-FG stays available as a fallback, for example if XeSS-FG does not start on your system (the status panel and `f4sr.log` say why). FSR-FG always uses the Classic pipeline.
 
@@ -233,3 +235,4 @@ Third-party components ship under their own licenses, reproduced in `licenses/`:
 - AMD FidelityFX SDK runtime DLLs: AMD license (binary redistribution, no modification).
 - Intel XeSS SDK DLLs: Intel Simplified Software License (binary redistribution, no modification).
 - fmt and spdlog: MIT.
+- AMD Anti-Lag 2 SDK header (compiled in, Low Latency option): MIT.

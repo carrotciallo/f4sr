@@ -13,6 +13,7 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
 
 #include "ffx_runtime.h"
 #include "hooks.h"
@@ -97,6 +98,9 @@ namespace f4sr
 	// Values the MCM page saved override the plugin ini. `startup` also reads
 	// the keys that only apply at launch (frame-generation engine, FSR
 	// jitter-cancellation flag). Clamps the ranged values.
+	// This session's settings as loaded at startup (for UpdateRestartPending).
+	static Settings g_startup;
+
 	static void ApplyMcmSettings(Settings& s, bool startup)
 	{
 		const std::string mcmIni = McmIniPath();
@@ -117,11 +121,13 @@ namespace f4sr
 		mcmBool("bEnableFrameGeneration", s.enableFrameGeneration);
 		if (startup) mcmInt("iFrameGenEngine", s.frameGenEngine);
 		if (startup) mcmInt("iPipeline", s.pipeline);
+		if (startup) mcmBool("bXeFGAsyncPresent", s.asyncPresent);
 		if (startup) mcmBool("bPipelineFellBack", s.pipelineFellBack);
 		mcmInt("iXeFGInterpolations", s.xefgInterpolations);
 		int mode = -1;  // MCM dropdown: 0 = 2X, 1 = 3X, 2 = 4X (supersedes iXeFGInterpolations)
 		mcmInt("iXeFGMode", mode);
 		if (mode >= 0) s.xefgInterpolations = mode + 1;
+		mcmInt("iLowLatency", s.lowLatency);
 		mcmBool("bReactiveMask", s.reactiveMask);
 		mcmBool("bReShadeBeforeUI", s.reshadeBeforeUi);
 		mcmBool("bReShadeDepth", s.reshadeDepth);
@@ -137,6 +143,7 @@ namespace f4sr
 		s.qualityMode = std::clamp(s.qualityMode, 0, 3);
 		s.frameGenEngine = std::clamp(s.frameGenEngine, 0, 1);
 		s.xefgInterpolations = std::clamp(s.xefgInterpolations, 1, 3);
+		s.lowLatency = std::clamp(s.lowLatency, 0, 2);
 	}
 
 	// The plugin lives in Data\F4SE\Plugins; settings sit next to the exe
@@ -173,6 +180,7 @@ namespace f4sr
 		s.enableFrameGeneration = GetPrivateProfileIntA("f4sr", "bEnableFrameGeneration", 0, ini.c_str()) != 0;
 		s.frameGenEngine = GetPrivateProfileIntA("f4sr", "iFrameGenEngine", 1, ini.c_str());
 		s.xefgInterpolations = GetPrivateProfileIntA("f4sr", "iXeFGInterpolations", 1, ini.c_str());
+		s.lowLatency = GetPrivateProfileIntA("f4sr", "iLowLatency", 1, ini.c_str());
 		s.frameGenOverlay = GetPrivateProfileIntA("f4sr", "bFrameGenOverlay", 0, ini.c_str()) != 0;
 		s.frameGenCapture = GetPrivateProfileIntA("f4sr", "bFrameGenCapture", 0, ini.c_str()) != 0;
 		s.fgPresentPath = GetPrivateProfileIntA("f4sr", "iFGPresentPath", 0, ini.c_str());
@@ -200,6 +208,7 @@ namespace f4sr
 		s.dynResAudit = GetPrivateProfileIntA("f4sr", "bDynResAudit", 0, ini.c_str()) != 0;
 		s.uiRelayout = GetPrivateProfileIntA("f4sr", "bUiRelayout", 1, ini.c_str()) != 0;
 		s.reactiveMask = GetPrivateProfileIntA("f4sr", "bReactiveMask", 1, ini.c_str()) != 0;
+		s.asyncPresent = GetPrivateProfileIntA("f4sr", "iXeFGAsyncPresent", 0, ini.c_str()) == 1;
 		s.reshadeBeforeUi = GetPrivateProfileIntA("f4sr", "bReShadeBeforeUI", 0, ini.c_str()) != 0;
 		s.reshadeDepth = GetPrivateProfileIntA("f4sr", "bReShadeDepth", 1, ini.c_str()) != 0;
 		{
@@ -227,10 +236,14 @@ namespace f4sr
 		F4SE::log::info("f4sr: diagnostics overlay={} fgCapture={} captures={} captureKey=0x{:02X} textureProbe={} postDepth={} dynResGuard={}",
 			s.frameGenOverlay, s.frameGenCapture, s.diagnostics, s.captureKey, s.textureProbe, s.postDepth, s.dynResGuard);
 
+		// Carry the pre-1.1 plugin-ini switch into the MCM toggle, so it shows what runs.
+		if (s.asyncPresent && GetPrivateProfileIntA("Main", "bXeFGAsyncPresent", -1, McmIniPath().c_str()) == -1)
+			WriteMcmValue("bXeFGAsyncPresent", "1");
+		g_startup = s;
 		s.reactiveScale = std::clamp(s.reactiveScale, 0.0f, 4.0f);
 		F4SE::log::info("f4sr: reactive mask {} (scale {:.2f})", s.reactiveMask ? "on" : "off", s.reactiveScale);
-		F4SE::log::info("f4sr settings: upscaling={} backend={} quality={} sharpness={} frameGen={} fgEngine={} xefgInterpolations={} enbSubNative={} debugView={} enbPresent={} mvJitterCancellation={}",
-			s.enableUpscaling, s.backend, s.qualityMode, s.sharpness, s.enableFrameGeneration, s.frameGenEngine, s.xefgInterpolations, s.enbSubNative, s.debugView, ENBPresent(), s.mvJitterCancellation);
+		F4SE::log::info("f4sr settings: upscaling={} backend={} quality={} sharpness={} frameGen={} fgEngine={} xefgInterpolations={} lowLatency={} enbSubNative={} debugView={} enbPresent={} mvJitterCancellation={}",
+			s.enableUpscaling, s.backend, s.qualityMode, s.sharpness, s.enableFrameGeneration, s.frameGenEngine, s.xefgInterpolations, s.lowLatency, s.enbSubNative, s.debugView, ENBPresent(), s.mvJitterCancellation);
 	}
 
 	Settings ReadMcmSettings()
@@ -238,9 +251,36 @@ namespace f4sr
 		auto s = GetSettings();
 		ApplyMcmSettings(s, false);
 		F4SE::log::info("f4sr: diagnostics overlay={} fgCapture={}", s.frameGenOverlay, s.frameGenCapture);
-		F4SE::log::info("f4sr: MCM settings requested: upscaling={} backend={} quality={} sharpness={} frameGen={} xefgInterpolations={} debugView={} forceReset={}",
-			s.enableUpscaling, s.backend, s.qualityMode, s.sharpness, s.enableFrameGeneration, s.xefgInterpolations, s.debugView, s.forceReset);
+		F4SE::log::info("f4sr: MCM settings requested: upscaling={} backend={} quality={} sharpness={} frameGen={} xefgInterpolations={} lowLatency={} debugView={} forceReset={}",
+			s.enableUpscaling, s.backend, s.qualityMode, s.sharpness, s.enableFrameGeneration, s.xefgInterpolations, s.lowLatency, s.debugView, s.forceReset);
 		return s;
+	}
+
+	void UpdateRestartPending()
+	{
+		const std::string mcmIni = McmIniPath();
+		auto mcm = [&](const char* key, int fallback) {
+			return static_cast<int>(GetPrivateProfileIntA("Main", key, fallback, mcmIni.c_str()));
+		};
+		const Settings& start = g_startup;
+		std::vector<std::string> items;
+		// A UI Native failure writes iPipeline=0 itself; its alert explains that.
+		const int pipeline = std::clamp(mcm("iPipeline", start.pipeline), 0, 1);
+		if (pipeline != start.pipeline && mcm("bPipelineFellBack", 0) == 0)
+			items.push_back(std::string("Pipeline: ") + (pipeline == 1 ? "UI Native" : "Classic"));
+		const int engine = std::clamp(mcm("iFrameGenEngine", start.frameGenEngine), 0, 1);
+		if (engine != start.frameGenEngine) items.push_back(std::string("Frame generation engine: ") + (engine == 1 ? "XeSS-FG" : "FSR-FG"));
+		if (start.frameGenEngine == 1 && engine == 1 && GetSettings().enableFrameGeneration && xefg::GenerationNeedsRestart())
+			items.push_back("Frame generation on");
+		// The mask texture is created with the upscaler at startup.
+		if (!start.reactiveMask && GetSettings().reactiveMask) items.push_back("Transparency Mask on");
+		if (start.frameGenEngine == 1) {
+			const bool async = mcm("bXeFGAsyncPresent", start.asyncPresent ? 1 : 0) != 0;
+			if (async != start.asyncPresent) items.push_back(std::string("Async present ") + (async ? "on" : "off"));
+		}
+		std::string lines;
+		for (const auto& item : items) lines += "\t^" + item + "\n";
+		sr_status::SetRestartLines(std::move(lines));
 	}
 
 	std::uint64_t McmSettingsWriteTime()

@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "ffx_api.h"
+#include "vram_budget.h"
 
 namespace f4sr
 {
@@ -51,5 +52,6 @@ namespace f4sr
 
 	private:
 		ffxContext context_{ nullptr };
+		vram_budget::SdkBytes sdkBytes_;
 	};
 }

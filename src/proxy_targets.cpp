@@ -1,4 +1,5 @@
 #include "proxy_targets.h"
+#include "vram_budget.h"
 
 #include "F4SE/F4SE.h"
 #include "RE/Fallout.h"
@@ -247,6 +248,7 @@ namespace f4sr
 			ReleaseProxy(logical);
 			return;
 		}
+		vram_budget::TrackTexture(proxyTex_[logical].Get());
 		proxies_[logical].texture = proxyTex_[logical].Get();
 		proxies_[logical].rtView = proxyRtv_[logical].Get();
 		proxies_[logical].srView = proxySrv_[logical].Get();
@@ -323,6 +325,7 @@ namespace f4sr
 		srvDesc.Format = desc.Format;
 		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		srvDesc.Texture2D.MipLevels = 1;
+		vram_budget::TrackTexture(depthTex_.Get());
 		const auto srvHr = device->CreateShaderResourceView(depthTex_.Get(), &srvDesc, depthSrv_.GetAddressOf());
 		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
 		uavDesc.Format = desc.Format;

@@ -1,4 +1,5 @@
 #include "interop.h"
+#include "vram_budget.h"
 
 #include "F4SE/F4SE.h"
 
@@ -94,6 +95,10 @@ namespace f4sr
 		device11_.Reset();
 		fence11_.Reset();
 		fence12_.Reset();
+		ready11_.Reset();
+		ready12_.Reset();
+		retired11_.Reset();
+		retired12_.Reset();
 		for (auto& l : lists_) l.Reset();
 		for (auto& a : allocators_) a.Reset();
 		queue12_.Reset();
@@ -130,6 +135,7 @@ namespace f4sr
 			return false;
 		}
 		replacement.desc = desc;
+		vram_budget::TrackTexture(replacement.tex11.Get());
 		out = std::move(replacement);
 		return true;
 	}
@@ -232,5 +238,50 @@ namespace f4sr
 	bool D3D12Interop::WaitOnD3D12()
 	{
 		return Check(queue12_->Wait(fence12_.Get(), fenceValue_), "D3D12 Wait");
+	}
+
+	bool D3D12Interop::CreateSharedFence(ComPtr<ID3D12Fence>& fence12, ComPtr<ID3D11Fence>& fence11, const char* what)
+	{
+		if (!Check(device12_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(fence12.ReleaseAndGetAddressOf())), what)) return false;
+		HANDLE sharedHandle = nullptr;
+		if (!Check(device12_->CreateSharedHandle(fence12.Get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle), what)) return false;
+		ComPtr<ID3D11Device5> device5;
+		HRESULT hr = device11_->QueryInterface(IID_PPV_ARGS(device5.GetAddressOf()));
+		if (SUCCEEDED(hr)) hr = device5->OpenSharedFence(sharedHandle, IID_PPV_ARGS(fence11.ReleaseAndGetAddressOf()));
+		CloseHandle(sharedHandle);
+		return Check(hr, what);
+	}
+
+	bool D3D12Interop::CreateAsyncFences()
+	{
+		if (ready12_ && retired12_) return true;
+		if (device11_ == nullptr || device12_ == nullptr) return false;
+		return CreateSharedFence(ready12_, ready11_, "async ready fence") && CreateSharedFence(retired12_, retired11_, "async retired fence");
+	}
+
+	bool D3D12Interop::SignalReadyFromD3D11(ID3D11DeviceContext* ctx11, std::uint64_t value)
+	{
+		ComPtr<ID3D11DeviceContext4> ctx4;
+		if (!Check(ctx11->QueryInterface(IID_PPV_ARGS(ctx4.GetAddressOf())), "context4 Signal interface") ||
+			!Check(ctx4->Signal(ready11_.Get(), value), "D3D11 ready Signal")) return false;
+		ctx11->Flush();  // submit the signal before the present thread waits on it
+		return true;
+	}
+
+	bool D3D12Interop::WaitReadyOnD3D12(std::uint64_t value)
+	{
+		return Check(queue12_->Wait(ready12_.Get(), value), "D3D12 ready Wait");
+	}
+
+	bool D3D12Interop::SignalRetiredFromD3D12(std::uint64_t value)
+	{
+		return Check(queue12_->Signal(retired12_.Get(), value), "D3D12 retired Signal");
+	}
+
+	bool D3D12Interop::WaitRetiredOnD3D11(ID3D11DeviceContext* ctx11, std::uint64_t value)
+	{
+		ComPtr<ID3D11DeviceContext4> ctx4;
+		return Check(ctx11->QueryInterface(IID_PPV_ARGS(ctx4.GetAddressOf())), "context4 Wait interface") &&
+			Check(ctx4->Wait(retired11_.Get(), value), "D3D11 retired Wait");
 	}
 }

@@ -6,6 +6,7 @@
 
 #include "upscaling.h"  // UpscaleFrame
 #include "xess/xess_d3d12.h"
+#include "vram_budget.h"
 
 namespace f4sr
 {
@@ -30,6 +31,7 @@ namespace f4sr
 	private:
 		bool CreateImpl(ID3D12Device* device, xess_2d_t output, int qualityMode, bool responsiveMask, const xess_2d_t* pathBInput);
 		xess_context_handle_t context_{ nullptr };
+		vram_budget::SdkBytes sdkBytes_;
 		bool responsiveMask_{ false };
 	};
 }

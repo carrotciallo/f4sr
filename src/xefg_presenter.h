@@ -44,6 +44,8 @@ namespace f4sr
 		// The swap chain redirect was installed at startup (XeSS-FG selected and
 		// frame generation on).
 		[[nodiscard]] bool RedirectInstalled();
+		// Frame generation was off at startup, so XeSS-FG is not loaded.
+		[[nodiscard]] bool GenerationNeedsRestart();
 		// Path B is running: the game renders at its own size and frames are
 		// scaled to the proxy chain's (display) size.
 		[[nodiscard]] bool OutputScaling();
